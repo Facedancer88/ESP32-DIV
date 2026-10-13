@@ -3615,6 +3615,7 @@ void handleSubGHzSubmenuButtons() {
                     break;
                 }
             }
+            subjammer::exit();
             if (feature_exit_requested) {
                 in_sub_menu = true;
                 is_main_menu = false;
@@ -3840,6 +3841,7 @@ void handleSubGHzSubmenuButtons() {
                             break;
                         }
                     }
+                    subjammer::exit();
                     if (feature_exit_requested) {
                         in_sub_menu = true;
                         is_main_menu = false;
