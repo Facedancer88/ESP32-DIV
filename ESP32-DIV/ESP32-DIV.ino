@@ -1331,6 +1331,7 @@ void handleWiFiSubmenuButtons() {
                     break;
                 }
             }
+            PacketMonitor::ptmTeardown();
             if (feature_exit_requested) {
                 in_sub_menu = true;
                 is_main_menu = false;
@@ -1745,6 +1746,7 @@ void handleWiFiSubmenuButtons() {
                             break;
                         }
                     }
+                    PacketMonitor::ptmTeardown();
                     if (feature_exit_requested) {
                         in_sub_menu = true;
                         is_main_menu = false;
