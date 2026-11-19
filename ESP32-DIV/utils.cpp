@@ -1328,14 +1328,14 @@ void displayLogo(uint16_t color, int displayTime) {
 
   textY += 14;
   tft.setCursor(screenWidth / 3.5, textY);
-  tft.print("Claude Edition");
+  tft.print("EISENFAUST");
 
   Serial.println("==================================");
   serialPrintObf(OBF_PN, sizeof(OBF_PN), true);
   Serial.print("Developed by: "); serialPrintObf(OBF_DN, sizeof(OBF_DN), true);
   // Version is intentionally NOT obfuscated.
   Serial.print("Version:      "); Serial.println(ESP32DIV_VERSION);
-  Serial.println("Build:        Claude Edition (BLE/WiFi fixes + BLE Blast)");
+  Serial.println("Build:        EISENFAUST (BLE/WiFi fixes + BLE Blast)");
   Serial.print("Contact:      "); serialPrintObf(OBF_EM, sizeof(OBF_EM), true);
   Serial.print("GitHub:       "); serialPrintObf(OBF_GH, sizeof(OBF_GH), true);
   Serial.print("Website:      "); serialPrintObf(OBF_WB, sizeof(OBF_WB), true);

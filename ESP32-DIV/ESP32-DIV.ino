@@ -5104,6 +5104,22 @@ void handleAboutPage() {
   tft.setTextColor(UI_TEXT, UI_BG);
   tft.setCursor(xValue, y);
   tftPrintObf(OBF_WB, sizeof(OBF_WB));
+  y += step;
+
+  tft.setTextColor(UI_DIM_TEXT, UI_BG);
+  tft.setCursor(xLabel, y);
+  tft.print("Edition");
+  tft.setTextColor(UI_ICON, UI_BG);
+  tft.setCursor(xValue, y);
+  tft.print("EISENFAUST");
+  y += step;
+
+  tft.setTextColor(UI_DIM_TEXT, UI_BG);
+  tft.setCursor(xLabel, y);
+  tft.print("Author");
+  tft.setTextColor(UI_TEXT, UI_BG);
+  tft.setCursor(xValue, y);
+  tft.print("Facedancer88");
 
   tft.setTextColor(UI_DIM_TEXT, UI_BG);
   tft.setCursor(16, 300);
