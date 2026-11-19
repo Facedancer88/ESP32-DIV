@@ -4,6 +4,7 @@
 #include <cmath>
 #include <vector>
 #include "driver/gpio.h"
+#include "soc/rtc_cntl_reg.h"
 #include "Touchscreen.h"
 #include "config.h"
 #include "freertos/FreeRTOS.h"
@@ -959,7 +960,12 @@ void initSDCard() {
   updateSdCardStatus();
   return;
 #else
+  // SD card init current spike can brownout the S3 — same issue as classic
+  // ESP32 ("3 sd" reboot).  Suppress the detector during mount.
+  uint32_t savedBod = READ_PERI_REG(RTC_CNTL_BROWN_OUT_REG);
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
   restoreSdAfterSharedSpi();
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, savedBod);
   updateSdCardStatus();
 #endif
 }

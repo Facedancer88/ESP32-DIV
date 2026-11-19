@@ -4514,6 +4514,11 @@ void setup() {
   WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
 #endif
 
+#if defined(SD_CS)
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+#endif
+
   tft.init();
   tft.setRotation(TFT_ROTATION);
 
