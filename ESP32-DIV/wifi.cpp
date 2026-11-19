@@ -5364,6 +5364,13 @@ void runUI() {
 
 void deautherSetup() {
     pauseBackgroundRadioTasks();
+    // Release the SD card for the duration of the attack. The deauther never
+    // touches SD, but on the S3 a mounted FAT volume holds heap (and parks the
+    // shared SPI bus); with a card inserted that dropped free heap under the
+    // attack's 60KB low-heap guard, so the deauth "stopped immediately". Ending
+    // the mount reproduces the known-good card-removed heap state. Other
+    // features remount SD on demand after we exit.
+    SD.end();
     setTouchButtonInputEnabled(true);
     deautherUpdateNavLabels(false);
     featureClearContent(TFT_BLACK);
