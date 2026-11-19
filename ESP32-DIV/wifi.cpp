@@ -1271,41 +1271,20 @@ void beaconSpam() {
     if (spamYFits(50 + y_offset, 10)) {
       tft.setTextColor(UI_TEXT, TFT_BLACK);
       tft.setCursor(2, 50 + y_offset);
-      tft.print("[!!] Press [Select] to exit");
+      tft.print("[!!] Tap [Exit] to stop");
     }
     maintainTouchNavBar();
 
     delay(300);
 
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_err_t err = esp_wifi_init(&cfg);
-    if (err != ESP_OK) {
-        Serial.printf("WiFi init failed: %d\n", err);
-        return;
-    }
-
-    err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    if (err != ESP_OK) {
-        Serial.printf("Storage set failed: %d\n", err);
-        return;
-    }
-
-    err = esp_wifi_set_mode(WIFI_MODE_AP);
-    if (err != ESP_OK) {
-        Serial.printf("Mode set failed: %d\n", err);
-        return;
-    }
-
-    err = esp_wifi_start();
-    if (err != ESP_OK) {
-        Serial.printf("WiFi start failed: %d\n", err);
-        return;
-    }
-
-    err = esp_wifi_set_promiscuous(true);
-    if (err != ESP_OK) {
-        Serial.printf("Promiscuous set failed: %d\n", err);
-        return;
+    // WiFi is already initialized and the hidden SoftAP is already running from
+    // beaconSpamSetup(). Re-running esp_wifi_init()/esp_wifi_start() on an
+    // already-running radio wedged the WiFi stack on the ESP32-S3 -- that was
+    // the "random flood locks up" bug. Reuse the running AP interface, exactly
+    // like spammer() does (it never re-inits either).
+    const int ssidN = activeSsidCount();
+    if (ssidN <= 0) {
+        return;  // nothing to broadcast; also guards the modulo below
     }
 
     uint8_t floodIdx = 0;
@@ -1313,7 +1292,7 @@ void beaconSpam() {
         channel = (uint8_t)random(1, kMaxChannel + 1);
         esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
-        const char* ssid = activeSsid(floodIdx % activeSsidCount());
+        const char* ssid = activeSsid(floodIdx % ssidN);
         floodIdx++;
 
         uint8_t mac[6] = {
@@ -1334,9 +1313,14 @@ void beaconSpam() {
 
         delay(1);
 
-      if (isButtonPressed(BTN_SELECT)) {
-        break;
-      }
+        // featureExitButtonPressed() stops the flood from EITHER the physical
+        // BTN_SELECT or the touch-nav Exit button (level-sensitive, reads the
+        // touchscreen live); the global feature-exit flag covers the rest. The
+        // real lockup was the WiFi re-init above, not the exit -- this just
+        // makes the loop cleanly stoppable on both input types.
+        if (featureExitButtonPressed() || feature_exit_requested) {
+            break;
+        }
 
     }
 }
