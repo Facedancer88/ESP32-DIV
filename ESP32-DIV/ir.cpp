@@ -3,6 +3,7 @@
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
 #include <IRutils.h>
+#include <ir_LG.h>
 #include <ArduinoJson.h>
 #include <SD.h>
 #include <algorithm>
@@ -48,11 +49,18 @@ static void irSetSavedNavLabels() {
 }
 
 static void irSetUniversalRemoteNavLabels() {
-  setTouchNavLabels("Prev", "Browse", "Exit", "Reload", "Next");
+  setTouchNavLabels("Prev", "Del", "Exit", "Reload", "Next");
 }
 
 static void irSetUniversalBrowseNavLabels() {
   setTouchNavLabels("Back", "Next", "Exit", "Prev", "Select");
+}
+
+static void irSetCopyNavLabels(const char* left, const char* down, const char* center,
+                               const char* up, const char* right) {
+  setTouchNavLabels(left, down, center, up, right);
+  // Don't force an immediate full nav bar redraw here — maintainTouchNavBar()
+  // in the feature loop will paint once when the cue is invalidated.
 }
 
 
@@ -1979,10 +1987,66 @@ void loop() {
 
 }
 
+// Shared Copy Controller → Universal bridge (session RAM + known SD paths).
+// SD directory scans are flaky on shared-SPI boards; Universal always merges these.
+static constexpr int kIrCustomKeySlots = 12;
+static constexpr int kIrRamCustomMax = 8;
+static constexpr const char* kIrUnivCustomPath = "/ir/univ_custom.json";
+static constexpr const char* kIrUnivCustomRoot = "/univ_custom.json";
+
+struct IrRamCustomProfile {
+  bool used = false;
+  char name[40]{};
+  decode_type_t proto = decode_type_t::UNKNOWN;
+  uint16_t bits = 0;
+  uint64_t code[kIrCustomKeySlots]{};
+  bool has[kIrCustomKeySlots]{};
+};
+
+static IrRamCustomProfile s_ramCustoms[kIrRamCustomMax];
+static uint8_t s_ramCustomCount = 0;
+
+static void irRamCustomRemember(const char* name, decode_type_t proto, uint16_t bits,
+                                const uint64_t* codes, const bool* hasKeys) {
+  if (!name || !name[0] || !codes || !hasKeys) return;
+
+  // Replace same name if already cached.
+  int slot = -1;
+  for (int i = 0; i < (int)s_ramCustomCount; i++) {
+    if (s_ramCustoms[i].used && strncmp(s_ramCustoms[i].name, name, sizeof(s_ramCustoms[i].name)) == 0) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    if (s_ramCustomCount < kIrRamCustomMax) {
+      slot = s_ramCustomCount++;
+    } else {
+      // Drop oldest.
+      for (int i = 0; i < kIrRamCustomMax - 1; i++) s_ramCustoms[i] = s_ramCustoms[i + 1];
+      slot = kIrRamCustomMax - 1;
+      s_ramCustomCount = kIrRamCustomMax;
+    }
+  }
+
+  IrRamCustomProfile& p = s_ramCustoms[slot];
+  p = IrRamCustomProfile{};
+  p.used = true;
+  strncpy(p.name, name, sizeof(p.name) - 1);
+  p.proto = proto;
+  p.bits = bits;
+  for (int i = 0; i < kIrCustomKeySlots; i++) {
+    p.has[i] = hasKeys[i];
+    p.code[i] = hasKeys[i] ? codes[i] : 0;
+  }
+}
+
 namespace IRUniversalController {
 
 static constexpr const char* PROFILES_PATH = "/ir_profiles.json";
 static constexpr const char* PROFILES_DIR  = "/ir_profiles";
+static constexpr const char* UNIV_CUSTOM_PATH = "/ir/univ_custom.json";
+static constexpr const char* UNIV_CUSTOM_ROOT = "/univ_custom.json";
 
 static IRsend s_send(IR_TX_PIN);
 
@@ -2019,6 +2083,7 @@ static constexpr int kBrowseHeaderH = 14;
 static constexpr int kListY = kBrowseHeaderY + kBrowseHeaderH + 2;
 
 static constexpr int kIconBackX = 10;
+static constexpr int kIconDeleteX = 130;
 static constexpr int kIconBrowseX = 170;
 static constexpr int kIconReloadX = 210;
 
@@ -2035,6 +2100,7 @@ enum KeyId : uint8_t {
   Right,
   Ok,
   Back,
+  Settings,
   KeyCount
 };
 
@@ -2052,6 +2118,7 @@ static const char* keyLabel(KeyId k) {
     case Right: return "RIGHT";
     case Ok:    return "OK";
     case Back:  return "BACK";
+    case Settings: return "SET";
     default:    return "?";
   }
 }
@@ -2060,6 +2127,8 @@ struct Profile {
   String name;
   String category;
   String brand;
+  String source;  // "built-in" | "sd" | "custom"
+  String path;    // SD file path (empty for built-in / RAM-only)
   decode_type_t proto = decode_type_t::UNKNOWN;
   uint16_t bits = 0;
   // Keep as 64-bit so we can support protocols like RC6 (36-bit), Panasonic (48-bit),
@@ -2074,6 +2143,8 @@ static int s_profileIdx = 0;
 static bool s_uiDrawn = false;
 static String s_lastErr = "";
 static bool s_loadedFromSd = false;
+static bool s_deleteArmed = false;
+static uint32_t s_deleteArmUntilMs = 0;
 
 static FeatureUI::Button s_keyBtns[KeyCount];
 
@@ -2102,6 +2173,7 @@ static const unsigned char* keyIcon(KeyId k) {
     case Right: return bitmap_icon_RIGHT;
     case Ok:    return bitmap_icon_start;
     case Back:  return bitmap_icon_go_back;
+    case Settings: return bitmap_icon_document_gear;
     default:    return nullptr;
   }
 }
@@ -2157,6 +2229,7 @@ static bool keyFromToken(const String& tok, KeyId& out) {
   String k = normalizeToken(tok);
   if (k == "POWER" || k == "PWR") { out = Power; return true; }
   if (k == "MUTE") { out = Mute; return true; }
+  if (k == "SETTINGS" || k == "SET" || k == "MENU") { out = Settings; return true; }
   if (k == "VOLUP" || k == "VOLUMEUP" || k == "VOLPLUS" || k == "VUP" || k == "VOLP") { out = VolUp; return true; }
   if (k == "VOLDN" || k == "VOLDOWN" || k == "VOLUMEDOWN" || k == "VOLMINUS" || k == "VDN" || k == "VOLM") { out = VolDn; return true; }
   if (k == "CHUP" || k == "CHANUP" || k == "CHANNELUP" || k == "CHPLUS") { out = ChUp; return true; }
@@ -2188,7 +2261,63 @@ static bool protoFromToken(const String& tok, decode_type_t& out) {
   if (p == "GICABLE") { out = decode_type_t::GICABLE; return true; }
   if (p == "EPSON") { out = decode_type_t::EPSON; return true; }
 
+  // Fall back to IRremoteESP8266 name table (matches typeToString output).
+  decode_type_t lib = strToDecodeType(tok.c_str());
+  if (lib != decode_type_t::UNKNOWN) {
+    out = lib;
+    return true;
+  }
+
+  // Numeric enum id saved by Copy Controller.
+  if (p.length() > 0) {
+    bool allDigits = true;
+    for (int i = 0; i < (int)p.length(); i++) {
+      if (p[i] < '0' || p[i] > '9') { allDigits = false; break; }
+    }
+    if (allDigits) {
+      int id = p.toInt();
+      if (id > 0 && id <= (int)decode_type_t::kLastDecodeType) {
+        out = (decode_type_t)id;
+        return true;
+      }
+    }
+  }
+
   return false;
+}
+
+// Stable token for JSON — do not use typeToString() alone (round-trip can fail).
+static const char* protocolToken(decode_type_t p) {
+  switch (p) {
+    case decode_type_t::NEC: return "NEC";
+    case decode_type_t::NEC_LIKE: return "NECLIKE";
+    case decode_type_t::SONY: return "SONY";
+    case decode_type_t::SAMSUNG36: return "SAMSUNG36";
+    case decode_type_t::LG: return "LG";
+    case decode_type_t::LG2: return "LG2";
+    case decode_type_t::JVC: return "JVC";
+    case decode_type_t::DENON: return "DENON";
+    case decode_type_t::PANASONIC: return "PANASONIC";
+    case decode_type_t::RC5: return "RC5";
+    case decode_type_t::RC6: return "RC6";
+    case decode_type_t::PIONEER: return "PIONEER";
+    case decode_type_t::DISH: return "DISH";
+    case decode_type_t::GICABLE: return "GICABLE";
+    case decode_type_t::EPSON: return "EPSON";
+    default: return nullptr;
+  }
+}
+
+static bool resolveProtocol(JsonObject o, decode_type_t& proto) {
+  if (o.containsKey("protocol_id")) {
+    int id = o["protocol_id"] | 0;
+    if (id > 0 && id <= (int)decode_type_t::kLastDecodeType) {
+      proto = (decode_type_t)id;
+      return true;
+    }
+  }
+  const char* pr = o["protocol"] | "";
+  return protoFromToken(String(pr), proto);
 }
 
 static String inferCategoryFromName(const String& name) {
@@ -2221,10 +2350,12 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Samsung TV (common)";
+    p.source = "built-in";
     p.proto = decode_type_t::SAMSUNG36;
     p.bits = 32;
     p.code[Power] = 0xE0E040BFu; p.has[Power] = true;
     p.code[Mute]  = 0xE0E0F00Fu; p.has[Mute]  = true;
+    p.code[Settings] = 0xE0E058A7u; p.has[Settings] = true;  // menu
     p.code[VolUp] = 0xE0E0E01Fu; p.has[VolUp] = true;
     p.code[VolDn] = 0xE0E0D02Fu; p.has[VolDn] = true;
     p.code[ChUp]  = 0xE0E048B7u; p.has[ChUp]  = true;
@@ -2241,10 +2372,12 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "LG TV (common)";
+    p.source = "built-in";
     p.proto = decode_type_t::NEC;
     p.bits = 32;
     p.code[Power] = 0x20DF10EFu; p.has[Power] = true;
     p.code[Mute]  = 0x20DF906Fu; p.has[Mute]  = true;
+    p.code[Settings] = 0x20DFC23Du; p.has[Settings] = true;  // menu/settings
     p.code[VolUp] = 0x20DF40BFu; p.has[VolUp] = true;
     p.code[VolDn] = 0x20DFC03Fu; p.has[VolDn] = true;
     p.code[ChUp]  = 0x20DF00FFu; p.has[ChUp]  = true;
@@ -2258,13 +2391,34 @@ static void loadBuiltinProfiles() {
     s_profiles.push_back(p);
   }
 
+  // Common Roku remotes (NEC address 0x5743). PWR sends Home; SET sends
+  // options/subtitle (*). Other Roku address families (e.g. 0x57E3) need SD profiles.
+  {
+    Profile p{};
+    p.name = "Roku (common)";
+    p.source = "built-in";
+    p.proto = decode_type_t::NEC;
+    p.bits = 32;
+    p.code[Power] = 0x5743C03Fu; p.has[Power] = true;  // Home
+    p.code[Settings] = 0x57438679u; p.has[Settings] = true;  // * / options
+    p.code[Up]    = 0x57439867u; p.has[Up]    = true;
+    p.code[Down]  = 0x5743CC33u; p.has[Down]  = true;
+    p.code[Left]  = 0x57437887u; p.has[Left]  = true;
+    p.code[Right] = 0x5743B44Bu; p.has[Right] = true;
+    p.code[Ok]    = 0x574354ABu; p.has[Ok]    = true;
+    p.code[Back]  = 0x57436699u; p.has[Back]  = true;
+    s_profiles.push_back(p);
+  }
+
   {
     Profile p{};
     p.name = "Sony TV (common)";
+    p.source = "built-in";
     p.proto = decode_type_t::SONY;
     p.bits = 12;
     p.code[Power] = 0x0A90u; p.has[Power] = true;
     p.code[Mute]  = 0x0290u; p.has[Mute]  = true;
+    p.code[Settings] = 0x070u; p.has[Settings] = true;  // menu
     p.code[VolUp] = 0x0490u; p.has[VolUp] = true;
     p.code[VolDn] = 0x0C90u; p.has[VolDn] = true;
     p.code[ChUp]  = 0x0090u; p.has[ChUp]  = true;
@@ -2275,6 +2429,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Xbox 360";
+    p.source = "built-in";
     p.proto = decode_type_t::RC6;
     p.bits = 36;
     p.code[Power] = 0x0C800F740Cu; p.has[Power] = true;  
@@ -2284,6 +2439,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Epson Projector";
+    p.source = "built-in";
     p.proto = decode_type_t::EPSON;
     p.bits = 32;
     p.code[Power] = 0xC1AA09F6u; p.has[Power] = true;
@@ -2293,6 +2449,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "JVC VCR";
+    p.source = "built-in";
     p.proto = decode_type_t::JVC;
     p.bits = 16;
     p.code[Power] = 0xC2B8u; p.has[Power] = true; 
@@ -2302,6 +2459,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Denon AVR";
+    p.source = "built-in";
     p.proto = decode_type_t::DENON;
     p.bits = 15;
     p.code[Power] = 0x2278u; p.has[Power] = true;
@@ -2311,6 +2469,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Denon AVR";
+    p.source = "built-in";
     p.proto = decode_type_t::DENON;
     p.bits = 48;
     p.code[Power] = 0x2A4C028D6CE3ULL; p.has[Power] = true;
@@ -2320,6 +2479,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Panasonic";
+    p.source = "built-in";
     p.proto = decode_type_t::PANASONIC;
     p.bits = 48;
     p.code[Power] = 0x40040190ED7CULL; p.has[Power] = true;
@@ -2329,6 +2489,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "Pioneer";
+    p.source = "built-in";
     p.proto = decode_type_t::PIONEER;
     p.bits = 64;
     p.code[Power] = 0x55FF00AAAA00FF55ULL; p.has[Power] = true;
@@ -2338,6 +2499,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "DISH";
+    p.source = "built-in";
     p.proto = decode_type_t::DISH;
     p.bits = 16;
     p.code[Power] = 0x9C00u; p.has[Power] = true;
@@ -2347,6 +2509,7 @@ static void loadBuiltinProfiles() {
   {
     Profile p{};
     p.name = "GI Cable";
+    p.source = "built-in";
     p.proto = decode_type_t::GICABLE;
     p.bits = 16;
     p.code[Power] = 0x8807u; p.has[Power] = true;
@@ -2363,12 +2526,39 @@ static bool endsWith(const String& s, const char* suf) {
   return s.substring(sl - tl) == suf;
 }
 
+static bool profileAlreadyLoaded(const String& name, decode_type_t proto, const String& source) {
+  for (const auto& p : s_profiles) {
+    if (p.name == name && p.proto == proto && p.source == source) return true;
+  }
+  return false;
+}
+
 static bool parseProfilesJson(File& f, size_t docCapacity, String* errOut = nullptr) {
 
   if (docCapacity < 512) docCapacity = 512;
   DynamicJsonDocument doc(docCapacity);
   DeserializationError err = deserializeJson(doc, f);
   if (err) { if (errOut) *errOut = "JSON parse failed"; return false; }
+
+  int added = 0;
+
+  auto applySource = [](Profile& p, const char* srcField) {
+    String src = String(srcField ? srcField : "");
+    src.trim();
+    if (src.length()) {
+      p.source = src;
+    } else if (p.category.equalsIgnoreCase("CUSTOM") || p.brand.equalsIgnoreCase("CUSTOM")) {
+      p.source = "custom";
+    } else {
+      p.source = "sd";
+    }
+  };
+
+  auto pushProfile = [&](Profile& p) {
+    if (profileAlreadyLoaded(p.name, p.proto, p.source)) return;
+    s_profiles.push_back(p);
+    added++;
+  };
 
   JsonArray arr = doc["profiles"].as<JsonArray>();
   if (!arr.isNull()) {
@@ -2380,8 +2570,9 @@ static bool parseProfilesJson(File& f, size_t docCapacity, String* errOut = null
       const char* pr = o["protocol"] | "";
       const char* cat = o["category"] | "";
       const char* br  = o["brand"] | "";
+      const char* src = o["source"] | "";
       decode_type_t proto = decode_type_t::UNKNOWN;
-      if (!protoFromToken(String(pr), proto)) continue;
+      if (!resolveProtocol(o, proto)) continue;
 
       Profile p{};
       p.name = String(nm);
@@ -2390,6 +2581,7 @@ static bool parseProfilesJson(File& f, size_t docCapacity, String* errOut = null
       p.brand = String(br);
       if (!p.category.length()) p.category = inferCategoryFromName(p.name);
       if (!p.brand.length()) p.brand = inferBrandFromName(p.name);
+      applySource(p, src);
       p.proto = proto;
       p.bits = (uint16_t)(o["bits"] | ((proto == decode_type_t::SONY) ? 12 : 32));
 
@@ -2430,28 +2622,33 @@ static bool parseProfilesJson(File& f, size_t docCapacity, String* errOut = null
         }
       }
 
-      s_profiles.push_back(p);
+      pushProfile(p);
       if ((int)s_profiles.size() >= (int)kMaxProfiles) break;
     }
-    return !s_profiles.empty();
+    if (added == 0) { if (errOut) *errOut = "No profiles in JSON array"; return false; }
+    return true;
   }
 
   JsonObject o = doc.as<JsonObject>();
   if (!o.isNull() && (o.containsKey("name") || o.containsKey("protocol"))) {
     const char* nm = o["name"] | "";
-    const char* pr = o["protocol"] | "";
     const char* cat = o["category"] | "";
     const char* br  = o["brand"] | "";
+    const char* src = o["source"] | "";
     decode_type_t proto = decode_type_t::UNKNOWN;
-    if (!protoFromToken(String(pr), proto)) { if (errOut) *errOut = "Bad protocol"; return false; }
+    if (!resolveProtocol(o, proto)) { if (errOut) *errOut = "Bad protocol"; return false; }
 
     Profile p{};
     p.name = String(nm);
-    if (!p.name.length()) p.name = String(pr);
+    if (!p.name.length()) {
+      const char* pr = o["protocol"] | "";
+      p.name = String(pr);
+    }
     p.category = String(cat);
     p.brand = String(br);
     if (!p.category.length()) p.category = inferCategoryFromName(p.name);
     if (!p.brand.length()) p.brand = inferBrandFromName(p.name);
+    applySource(p, src);
     p.proto = proto;
     p.bits = (uint16_t)(o["bits"] | ((proto == decode_type_t::SONY) ? 12 : 32));
 
@@ -2472,8 +2669,8 @@ static bool parseProfilesJson(File& f, size_t docCapacity, String* errOut = null
         p.has[kid] = true;
       }
     }
-    s_profiles.push_back(p);
-    return true;
+    pushProfile(p);
+    return added > 0;
   }
 
   if (errOut) *errOut = "No profiles";
@@ -2481,63 +2678,203 @@ static bool parseProfilesJson(File& f, size_t docCapacity, String* errOut = null
 }
 
 static bool loadProfilesFromSd(String* errOut = nullptr) {
+  // Appends SD profiles onto whatever is already in s_profiles (builtins).
+  restoreSdAfterSharedSpi();
   if (!isSDCardAvailable()) { if (errOut) *errOut = "SD not available"; return false; }
-  s_profiles.clear();
 
-  if (SD.exists(PROFILES_PATH)) {
-    File f = SD.open(PROFILES_PATH, FILE_READ);
-    if (!f) { if (errOut) *errOut = "Open /ir_profiles.json failed"; return false; }
+  const size_t before = s_profiles.size();
+  uint16_t loadedFiles = 0;
+  String lastParseErr;
+
+  auto loadOnePath = [&](const String& path, size_t capacity = 4096) {
+    File f = SD.open(path, FILE_READ);
+    if (!f) return;
+    // Skip empty files.
+    if (f.size() == 0) { f.close(); return; }
     String perr;
-
-    bool ok = parseProfilesJson(f, 8192, &perr);
-    f.close();
-    if (!ok) { if (errOut) *errOut = perr; return false; }
-    if (errOut) *errOut = String("Loaded ") + String((int)s_profiles.size()) + " profiles";
-    return true;
-  }
-
-  if (!SD.exists(PROFILES_DIR)) { if (errOut) *errOut = "No /ir_profiles.json or /ir_profiles/"; return false; }
-  File d = SD.open(PROFILES_DIR);
-  if (!d) { if (errOut) *errOut = "Open /ir_profiles failed"; return false; }
-
-  uint16_t loaded = 0;
-  for (;;) {
-    File f = d.openNextFile();
-    if (!f) break;
-    if (!f.isDirectory()) {
-      String name = String(f.name());
-      if (endsWith(name, ".json")) {
-        String perr;
-        if (parseProfilesJson(f, 2048, &perr)) {
-          loaded++;
-          if ((int)s_profiles.size() >= (int)kMaxProfiles) { f.close(); break; }
+    const size_t beforeFile = s_profiles.size();
+    if (parseProfilesJson(f, capacity, &perr)) {
+      if (s_profiles.size() > beforeFile) {
+        loadedFiles++;
+        for (size_t i = beforeFile; i < s_profiles.size(); i++) {
+          if (!s_profiles[i].path.length()) s_profiles[i].path = path;
         }
       }
+    } else if (perr.length()) {
+      lastParseErr = perr + "@" + path;
     }
     f.close();
-  }
-  d.close();
+  };
 
-  if (s_profiles.empty()) { if (errOut) *errOut = "No profiles in /ir_profiles/"; return false; }
-  if (errOut) *errOut = String("Loaded ") + String((int)s_profiles.size()) + " profiles";
+  auto scanDirForJson = [&](const char* dirPath) {
+    File d = SD.open(dirPath);
+    if (!d) return;
+    if (!d.isDirectory()) { d.close(); return; }
+    for (;;) {
+      File entry = d.openNextFile();
+      if (!entry) break;
+      if (!entry.isDirectory()) {
+        String name = String(entry.name());
+        String base = name;
+        int slash = name.lastIndexOf('/');
+        if (slash >= 0) base = name.substring(slash + 1);
+        // Copy Controller marker files are loaded explicitly; still allow other
+        // library JSON in the same folder.
+        if (endsWith(base, ".json") || endsWith(base, ".JSON")) {
+          String full = name;
+          if (!name.startsWith("/")) {
+            String root = String(dirPath);
+            if (root.length() && root[0] != '/') root = "/" + root;
+            if (!root.endsWith("/")) root += "/";
+            full = root + base;
+          }
+          entry.close();
+          loadOnePath(full);
+          if ((int)s_profiles.size() >= (int)kMaxProfiles) break;
+          continue;
+        }
+      }
+      entry.close();
+    }
+    d.close();
+  };
+
+  // 1) User-managed multi-profile library (must load first, never overwritten by Copy).
+  loadOnePath(String(PROFILES_PATH), 16384);
+
+  // 2) Profile folders.
+  scanDirForJson(PROFILES_DIR);
+  scanDirForJson("/ir_profiles");
+  scanDirForJson("/profiles");
+  scanDirForJson("profiles");
+
+  // 3) /ir folder (Record + Copy Controller + any hand-placed JSON).
+  scanDirForJson("/ir");
+  scanDirForJson("ir");
+
+  // 4) Explicit Copy Controller fallbacks (deduped if already loaded via scan).
+  loadOnePath(String(UNIV_CUSTOM_PATH));
+  loadOnePath(String(UNIV_CUSTOM_ROOT));
+  loadOnePath(String("/irc.json"));
+
+  // 5) Root-level custom files.
+  {
+    File root = SD.open("/");
+    if (root) {
+      for (;;) {
+        File entry = root.openNextFile();
+        if (!entry) break;
+        if (!entry.isDirectory()) {
+          String name = String(entry.name());
+          String base = name;
+          int slash = name.lastIndexOf('/');
+          if (slash >= 0) base = name.substring(slash + 1);
+          const bool cust =
+              base.indexOf("ir_cust_") >= 0 ||
+              base.equalsIgnoreCase("irc.json") ||
+              base.equalsIgnoreCase("univ_custom.json") ||
+              base.startsWith("prof_");
+          if (cust && (endsWith(base, ".json") || endsWith(base, ".JSON"))) {
+            String full = name.startsWith("/") ? name : (String("/") + base);
+            entry.close();
+            loadOnePath(full);
+            if ((int)s_profiles.size() >= (int)kMaxProfiles) break;
+            continue;
+          }
+        }
+        entry.close();
+      }
+      root.close();
+    }
+  }
+
+  if (s_profiles.size() <= before) {
+    if (errOut) {
+      if (lastParseErr.length()) *errOut = lastParseErr;
+      else *errOut = "No SD profiles found";
+    }
+    return false;
+  }
+  if (errOut) {
+    *errOut = String("+") + String((int)(s_profiles.size() - before)) +
+              " from SD (" + String(loadedFiles) + " files)";
+  }
   return true;
+}
+
+static void mergeRamCustomProfiles() {
+  for (int i = 0; i < (int)s_ramCustomCount; i++) {
+    const IrRamCustomProfile& c = s_ramCustoms[i];
+    if (!c.used || !c.name[0]) continue;
+
+    // Skip if already present (same name + custom).
+    bool exists = false;
+    for (const auto& p : s_profiles) {
+      if (p.name.equals(c.name) &&
+          (p.source == "custom" || p.category.equalsIgnoreCase("CUSTOM"))) {
+        exists = true;
+        break;
+      }
+    }
+    if (exists) continue;
+    if ((int)s_profiles.size() >= (int)kMaxProfiles) break;
+
+    Profile p{};
+    p.name = String(c.name);
+    p.category = "CUSTOM";
+    p.brand = "CUSTOM";
+    p.source = "custom";
+    p.proto = c.proto;
+    p.bits = c.bits;
+    const int n = (KeyCount < kIrCustomKeySlots) ? (int)KeyCount : kIrCustomKeySlots;
+    for (int k = 0; k < n; k++) {
+      p.has[k] = c.has[k];
+      p.code[k] = c.code[k];
+    }
+    s_profiles.push_back(p);
+  }
 }
 
 static void refreshProfiles() {
   s_lastErr = "";
   s_loadedFromSd = false;
 
+  loadBuiltinProfiles();
+
   String err;
   if (loadProfilesFromSd(&err)) {
     s_loadedFromSd = true;
-    s_lastErr = String("SD: ") + (err.length() ? err : String((int)s_profiles.size()));
-  } else {
-    loadBuiltinProfiles();
-    s_loadedFromSd = false;
-    if (err.length()) s_lastErr = "Built-in (SD: " + err + ")";
-    else s_lastErr = "Built-in";
+  } else if (err.length()) {
+    s_lastErr = err;
   }
 
+  mergeRamCustomProfiles();
+
+  int customCount = 0;
+  int sdCount = 0;
+  for (const auto& p : s_profiles) {
+    if (p.source == "custom" || p.category.equalsIgnoreCase("CUSTOM")) customCount++;
+    else if (p.source == "sd") sdCount++;
+  }
+
+  if (sdCount > 0 || customCount > 0) {
+    s_loadedFromSd = true;
+    s_lastErr = String("SD ") + String(sdCount) + " + Cust " + String(customCount);
+  } else if (s_lastErr.length()) {
+    s_lastErr = "Built-in (SD: " + s_lastErr + ")";
+  } else {
+    s_lastErr = "Built-in";
+  }
+
+  // Start on first custom if any; otherwise keep index 0 (builtins / SD).
+  s_profileIdx = 0;
+  for (int i = 0; i < (int)s_profiles.size(); i++) {
+    if (s_profiles[i].source == "custom" ||
+        s_profiles[i].category.equalsIgnoreCase("CUSTOM")) {
+      s_profileIdx = i;
+      break;
+    }
+  }
   if (s_profileIdx < 0) s_profileIdx = 0;
   if (s_profileIdx >= (int)s_profiles.size()) s_profileIdx = 0;
 }
@@ -2545,6 +2882,7 @@ static void refreshProfiles() {
 static void browseBack();
 static void openCategoryBrowser();
 static void reloadUniversalProfiles();
+static void deleteCurrentProfile();
 
 static void drawToolbar() {
   tft.fillRect(0, kToolbarY, 240, kToolbarH, UI_FG);
@@ -2552,6 +2890,7 @@ static void drawToolbar() {
   tft.drawBitmap(kIconBackX, kToolbarY, bitmap_icon_go_back, kIconSize, kIconSize, UI_ICON);
 
   if (s_screen == Screen::Remote) {
+    tft.drawBitmap(kIconDeleteX, kToolbarY, bitmap_icon_recycle, kIconSize, kIconSize, UI_ICON);
     tft.drawBitmap(kIconBrowseX, kToolbarY, bitmap_icon_list, kIconSize, kIconSize, UI_ICON);
     tft.drawBitmap(kIconReloadX, kToolbarY, bitmap_icon_undo, kIconSize, kIconSize, UI_ICON);
   }
@@ -2609,9 +2948,20 @@ static void drawInfoPanel() {
   tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
   tft.setCursor(kPadX, kInfoTextY + (kDetailLineStep * 2));
   tft.print("Src:");
-  tft.setTextColor(s_loadedFromSd ? UI_OK : UI_DIM_TEXT, FEATURE_BG);
   tft.setCursor(kDetailValueX, kInfoTextY + (kDetailLineStep * 2));
-  tft.print(s_loadedFromSd ? "SD card" : "Built-in");
+  if (s_deleteArmed && (int32_t)(millis() - s_deleteArmUntilMs) < 0) {
+    tft.setTextColor(UI_WARN, FEATURE_BG);
+    tft.print("Del? tap again");
+  } else if (p.source == "built-in" || (!p.source.length() && !s_loadedFromSd)) {
+    tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+    tft.print("Built-in");
+  } else if (p.source == "custom" || p.category.equalsIgnoreCase("CUSTOM")) {
+    tft.setTextColor(UI_OK, FEATURE_BG);
+    tft.print("Custom");
+  } else {
+    tft.setTextColor(UI_OK, FEATURE_BG);
+    tft.print("SD card");
+  }
 }
 
 static void drawBrowseHeader() {
@@ -2655,6 +3005,10 @@ static bool handleToolbarTouch(int x, int y) {
 
   if (s_screen != Screen::Remote) return false;
 
+  if (x > kIconDeleteX && x < (kIconDeleteX + kIconSize)) {
+    deleteCurrentProfile();
+    return true;
+  }
   if (x > kIconBrowseX && x < (kIconBrowseX + kIconSize)) {
     openCategoryBrowser();
     return true;
@@ -2819,16 +3173,18 @@ static void layoutKeyButtons() {
   const int topY = kRemoteKeysTop;
   const int bottomY = universalContentBottom() - 6;
 
-  const int gap = 6;
+  const int gap = 4;
   const int topBtnH = 34;
-  const int topBtnW = (kInfoBoxW - 2 * gap) / 3;
+  const int topBtnW = (kInfoBoxW - 3 * gap) / 4;
   const int yTop = topY;
   const int x0 = kInfoBoxX;
   const int x1 = x0 + topBtnW + gap;
-  const int x2 = kInfoBoxRight - topBtnW;
+  const int x2 = x1 + topBtnW + gap;
+  const int x3 = kInfoBoxRight - topBtnW;
   s_keyBtns[(int)Power] = {(int16_t)x0,(int16_t)yTop,(int16_t)topBtnW,(int16_t)topBtnH,keyLabel(Power),FeatureUI::ButtonStyle::Secondary,true};
-  s_keyBtns[(int)Mute]  = {(int16_t)x1,(int16_t)yTop,(int16_t)topBtnW,(int16_t)topBtnH,keyLabel(Mute), FeatureUI::ButtonStyle::Secondary,true};
-  s_keyBtns[(int)Back]  = {(int16_t)x2,(int16_t)yTop,(int16_t)topBtnW,(int16_t)topBtnH,keyLabel(Back), FeatureUI::ButtonStyle::Secondary,true};
+  s_keyBtns[(int)Settings] = {(int16_t)x1,(int16_t)yTop,(int16_t)topBtnW,(int16_t)topBtnH,keyLabel(Settings), FeatureUI::ButtonStyle::Secondary,true};
+  s_keyBtns[(int)Mute]  = {(int16_t)x2,(int16_t)yTop,(int16_t)topBtnW,(int16_t)topBtnH,keyLabel(Mute), FeatureUI::ButtonStyle::Secondary,true};
+  s_keyBtns[(int)Back]  = {(int16_t)x3,(int16_t)yTop,(int16_t)topBtnW,(int16_t)topBtnH,keyLabel(Back), FeatureUI::ButtonStyle::Secondary,true};
 
   const int yMidTop = yTop + topBtnH + 8;
   const int midH = bottomY - yMidTop;
@@ -2930,6 +3286,7 @@ static void sendKey(KeyId k) {
 
 static void changeProfile(int delta) {
   if (s_profiles.empty()) return;
+  s_deleteArmed = false;
   int n = (int)s_profiles.size();
   s_profileIdx = (s_profileIdx + delta) % n;
   if (s_profileIdx < 0) s_profileIdx += n;
@@ -2938,6 +3295,7 @@ static void changeProfile(int delta) {
 }
 
 static void openCategoryBrowser() {
+  s_deleteArmed = false;
   s_screen = Screen::Category;
   s_listSel = 0;
   rebuildCategoriesAndBrands();
@@ -2945,8 +3303,134 @@ static void openCategoryBrowser() {
 }
 
 static void reloadUniversalProfiles() {
+  s_deleteArmed = false;
   refreshProfiles();
   rebuildCategoriesAndBrands();
+  s_uiDrawn = false;
+}
+
+static void irRamForgetByName(const char* name) {
+  if (!name || !name[0]) return;
+  int w = 0;
+  for (int i = 0; i < (int)s_ramCustomCount; i++) {
+    if (!s_ramCustoms[i].used) continue;
+    if (strncmp(s_ramCustoms[i].name, name, sizeof(s_ramCustoms[i].name)) == 0) {
+      continue;  // drop
+    }
+    if (w != i) s_ramCustoms[w] = s_ramCustoms[i];
+    w++;
+  }
+  for (int i = w; i < kIrRamCustomMax; i++) s_ramCustoms[i] = IrRamCustomProfile{};
+  s_ramCustomCount = (uint8_t)w;
+}
+
+static bool rewriteAggregateWithoutProfile(const String& path, const Profile& victim) {
+  File f = SD.open(path, FILE_READ);
+  if (!f) return false;
+
+  DynamicJsonDocument doc(16384);
+  DeserializationError err = deserializeJson(doc, f);
+  f.close();
+  if (err) return false;
+
+  DynamicJsonDocument out(16384);
+  JsonArray outArr = out.createNestedArray("profiles");
+
+  auto keepObj = [&](JsonObject o) {
+    if (o.isNull()) return;
+    const char* nm = o["name"] | "";
+    const char* pr = o["protocol"] | "";
+    decode_type_t proto = decode_type_t::UNKNOWN;
+    resolveProtocol(o, proto);
+    if (String(nm) == victim.name && proto == victim.proto) return;
+    outArr.add(o);
+  };
+
+  JsonArray arr = doc["profiles"].as<JsonArray>();
+  if (!arr.isNull()) {
+    for (JsonVariant v : arr) keepObj(v.as<JsonObject>());
+  } else {
+    JsonObject o = doc.as<JsonObject>();
+    if (!o.isNull() && (o.containsKey("name") || o.containsKey("protocol"))) {
+      keepObj(o);
+    }
+  }
+
+  if (SD.exists(path)) SD.remove(path);
+  File w = SD.open(path, FILE_WRITE);
+  if (!w) w = SD.open(path.c_str(), "w");
+  if (!w) return false;
+  if (outArr.size() == 0) {
+    // Nothing left — remove empty library file.
+    w.close();
+    SD.remove(path);
+    return true;
+  }
+  const size_t n = serializeJson(out, w);
+  w.flush();
+  w.close();
+  return n > 0;
+}
+
+static void deleteCurrentProfile() {
+  if (s_profiles.empty() || s_profileIdx < 0 || s_profileIdx >= (int)s_profiles.size()) {
+    showNotification("IR", "No profile selected");
+    return;
+  }
+
+  const Profile victim = s_profiles[s_profileIdx];
+  if (victim.source == "built-in") {
+    showNotification("IR", "Can't delete built-in");
+    s_deleteArmed = false;
+    drawInfoPanel();
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (!s_deleteArmed || (int32_t)(now - s_deleteArmUntilMs) >= 0) {
+    s_deleteArmed = true;
+    s_deleteArmUntilMs = now + 4000;
+    drawInfoPanel();
+    return;
+  }
+  s_deleteArmed = false;
+
+  restoreSdAfterSharedSpi();
+
+  bool sdOk = true;
+  if (victim.path.length()) {
+    int samePath = 0;
+    for (const auto& p : s_profiles) {
+      if (p.path == victim.path) samePath++;
+    }
+
+    if (samePath > 1 || victim.path == String(PROFILES_PATH)) {
+      sdOk = rewriteAggregateWithoutProfile(victim.path, victim);
+      if (!sdOk) {
+        showNotification("IR", "SD update failed");
+        drawInfoPanel();
+        return;
+      }
+    } else if (isSDCardAvailable()) {
+      if (SD.exists(victim.path) && !SD.remove(victim.path)) {
+        showNotification("IR", "SD delete failed");
+        drawInfoPanel();
+        return;
+      }
+    }
+  }
+
+  irRamForgetByName(victim.name.c_str());
+
+  s_profiles.erase(s_profiles.begin() + s_profileIdx);
+  if (s_profiles.empty()) {
+    s_profileIdx = 0;
+  } else if (s_profileIdx >= (int)s_profiles.size()) {
+    s_profileIdx = (int)s_profiles.size() - 1;
+  }
+
+  rebuildCategoriesAndBrands();
+  showNotification("IR", sdOk ? "Profile deleted" : "Removed (SD issue)");
   s_uiDrawn = false;
 }
 
@@ -2993,7 +3477,7 @@ static void handleUniversalNavButtons() {
       changeProfile(-1);
     }
     if (isTouchNavButtonPressedEdge(BTN_DOWN)) {
-      openCategoryBrowser();
+      deleteCurrentProfile();
     }
     if (isTouchNavButtonPressedEdge(BTN_UP)) {
       reloadUniversalProfiles();
@@ -3036,9 +3520,34 @@ void loop() {
     return;
   }
 
+  if (isNotificationVisible()) {
+    maintainTouchNavBar();
+    int nx, ny;
+    bool dismissed = false;
+    if (readTouchXY(nx, ny)) {
+      dismissed = (notificationHandleTouch(nx, ny) != NotificationAction::None);
+    } else if (isPhysicalButtonPressed(BTN_SELECT) ||
+               isTouchNavButtonPressedEdge(BTN_SELECT) ||
+               isTouchNavButtonPressedEdge(BTN_LEFT)) {
+      hideNotification();
+      dismissed = true;
+    }
+    if (dismissed) {
+      s_uiDrawn = false;
+    }
+    delay(10);
+    return;
+  }
+
   if (!s_uiDrawn) drawAll();
   maintainTouchNavBar();
   handleUniversalNavButtons();
+
+  if (s_screen == Screen::Remote && s_deleteArmed &&
+      (int32_t)(millis() - s_deleteArmUntilMs) >= 0) {
+    s_deleteArmed = false;
+    drawInfoPanel();
+  }
 
   const uint32_t now = millis();
   static uint32_t lastBtnMs = 0;
@@ -3147,5 +3656,1476 @@ void loop() {
   if (!touchNow) touchWasDown = false;
 
   delay(10);
+}
+
+}  // namespace IRUniversalController
+
+namespace IRCopyController {
+
+static constexpr int kMaxKeys = 12;
+static const char* kKeyNames[kMaxKeys] = {
+    "Power", "Mute", "VolUp", "VolDn", "ChUp", "ChDn",
+    "Up", "Down", "Left", "Right", "Ok", "Back"};
+static const char* kKeyLabels[kMaxKeys] = {
+    "PWR", "MUTE", "VOL+", "VOL-", "CH+", "CH-",
+    "UP", "DOWN", "LEFT", "RIGHT", "OK", "BACK"};
+
+// Mirror of Universal's protocolToken — namespaces are separate.
+static const char* protocolToken(decode_type_t p) {
+  switch (p) {
+    case decode_type_t::NEC: return "NEC";
+    case decode_type_t::NEC_LIKE: return "NECLIKE";
+    case decode_type_t::SONY: return "SONY";
+    case decode_type_t::SAMSUNG36: return "SAMSUNG36";
+    case decode_type_t::LG: return "LG";
+    case decode_type_t::LG2: return "LG2";
+    case decode_type_t::JVC: return "JVC";
+    case decode_type_t::DENON: return "DENON";
+    case decode_type_t::PANASONIC: return "PANASONIC";
+    case decode_type_t::RC5: return "RC5";
+    case decode_type_t::RC6: return "RC6";
+    case decode_type_t::PIONEER: return "PIONEER";
+    case decode_type_t::DISH: return "DISH";
+    case decode_type_t::GICABLE: return "GICABLE";
+    case decode_type_t::EPSON: return "EPSON";
+    default: return nullptr;
   }
 }
+
+// No raw buffers — Universal profiles only need decoded codes (saves ~12KB RAM).
+struct CapturedKey {
+  bool has = false;
+  decode_type_t proto = decode_type_t::UNKNOWN;
+  uint16_t bits = 0;
+  uint64_t code = 0;
+};
+
+static constexpr int16_t kToolbarY = 20;
+static constexpr int16_t kToolbarH = 16;
+static constexpr int16_t kIconSize = 16;
+static constexpr int kToolbarBottom = kToolbarY + kToolbarH;
+static constexpr int kBodyTop = kToolbarBottom + 1;
+static constexpr int kIconBackX = 10;
+static constexpr int kPadX = 10;
+static constexpr int kBoxX = 4;
+static constexpr int kBoxW = 232;
+static constexpr int kBoxHeaderH = 15;
+static constexpr int kRadius = 3;
+static constexpr int kLineH = 14;
+
+static CapturedKey s_keys[kMaxKeys];
+static int s_currentKey = 0;
+static String s_controllerName;
+static bool s_hasCapture = false;
+static decode_type_t s_captureProto = decode_type_t::UNKNOWN;
+static uint16_t s_captureBits = 0;
+static uint64_t s_captureValue = 0;
+static decode_type_t s_lockedProto = decode_type_t::UNKNOWN;
+static uint16_t s_lockedBits = 0;
+static bool s_protoLocked = false;
+static bool s_uiDrawn = false;
+static bool s_exitAfterNotif = false;
+static uint32_t s_lastBtnMs = 0;
+static constexpr uint32_t kBtnDebounceMs = 280;
+
+static bool s_prevLeft = false;
+static bool s_prevRight = false;
+static bool s_prevUp = false;
+static bool s_prevDown = false;
+static bool s_prevSelect = false;
+
+static IRrecv s_recv(IR_RX_PIN);
+static decode_results s_results;
+
+static FeatureUI::Button s_actionBtns[3];  // Skip / Redo / Save (no-nav fallback + touch)
+
+static int capturedCount() {
+  int n = 0;
+  for (int i = 0; i < kMaxKeys; i++) {
+    if (s_keys[i].has) n++;
+  }
+  return n;
+}
+
+static bool allSlotsDone() { return s_currentKey >= kMaxKeys; }
+
+static uint8_t s_navMode = 255;  // cache so we don't flicker the touch nav bar
+
+static void applyNavLabels() {
+  if (!featureHasTouchNavBar()) return;
+
+  uint8_t mode;
+  if (allSlotsDone()) mode = 2;
+  else if (s_hasCapture) mode = 1;
+  else mode = (capturedCount() > 0) ? 3 : 0;
+  if (mode == s_navMode) return;
+  s_navMode = mode;
+
+  // setTouchNavLabels(left, down, center, up, right)
+  if (mode == 2) {
+    irSetCopyNavLabels(nullptr, nullptr, "Exit", nullptr, "Save");
+  } else if (mode == 1) {
+    irSetCopyNavLabels("Skip", nullptr, "Exit", "Redo", "Save");
+  } else if (mode == 3) {
+    irSetCopyNavLabels("Skip", "Done", "Exit", nullptr, nullptr);
+  } else {
+    irSetCopyNavLabels("Skip", nullptr, "Exit", nullptr, nullptr);
+  }
+}
+
+static void drawToolbar() {
+  tft.fillRect(0, kToolbarY, 240, kToolbarH, UI_FG);
+  tft.drawFastHLine(0, 19, 240, UI_LINE);
+  tft.drawBitmap(kIconBackX, kToolbarY, bitmap_icon_go_back, kIconSize, kIconSize, UI_ICON);
+  tft.drawFastHLine(0, kToolbarBottom, 240, UI_LINE);
+}
+
+static void drawLabeledBox(int y, int h, const char* title) {
+  tft.drawRoundRect(kBoxX, y, kBoxW, h, kRadius, UI_LINE);
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+  tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+  tft.drawString(title, kBoxX + 4, y + 3);
+}
+
+static void drawProgressBar(int x, int y, int w, int h, int done, int total) {
+  tft.drawRoundRect(x, y, w, h, 2, UI_LINE);
+  tft.fillRect(x + 1, y + 1, w - 2, h - 2, FEATURE_BG);
+  if (total <= 0) return;
+  int fill = ((w - 2) * done) / total;
+  if (fill > 0) {
+    tft.fillRoundRect(x + 1, y + 1, fill, h - 2, 2, UI_ICON);
+  }
+}
+
+static void layoutActionButtons() {
+  const int y = irContentBottom() - 28;
+  const int gap = 6;
+  const int btnW = (240 - kPadX * 2 - gap * 2) / 3;
+  const int h = 22;
+  s_actionBtns[0] = {(int16_t)kPadX, (int16_t)y, (int16_t)btnW, (int16_t)h, "Skip",
+                     FeatureUI::ButtonStyle::Secondary, false};
+  s_actionBtns[1] = {(int16_t)(kPadX + btnW + gap), (int16_t)y, (int16_t)btnW, (int16_t)h, "Redo",
+                     FeatureUI::ButtonStyle::Secondary, false};
+  s_actionBtns[2] = {(int16_t)(kPadX + (btnW + gap) * 2), (int16_t)y, (int16_t)btnW, (int16_t)h,
+                     allSlotsDone() || s_hasCapture ? "Save" : "Done",
+                     FeatureUI::ButtonStyle::Primary, false};
+
+  // Disable states that don't make sense.
+  s_actionBtns[0].disabled = allSlotsDone() || s_hasCapture;
+  s_actionBtns[1].disabled = !s_hasCapture || allSlotsDone();
+  if (allSlotsDone()) {
+    s_actionBtns[2].disabled = false;
+    s_actionBtns[2].label = "Save";
+  } else if (s_hasCapture) {
+    s_actionBtns[2].disabled = false;
+    s_actionBtns[2].label = "Save";
+  } else {
+    s_actionBtns[2].disabled = capturedCount() == 0;
+    s_actionBtns[2].label = "Done";
+  }
+}
+
+static void drawActionButtons() {
+  if (featureHasTouchNavBar()) return;
+  layoutActionButtons();
+  for (int i = 0; i < 3; i++) {
+    const FeatureUI::Button& b = s_actionBtns[i];
+    FeatureUI::drawButtonRect(b.x, b.y, b.w, b.h, b.label, b.style, false, b.disabled);
+  }
+}
+
+// Layout constants for dirty-region updates (must match drawUI chrome).
+static constexpr int kInfoY = kBodyTop + 34;
+static constexpr int kInfoH = kBoxHeaderH + kLineH * 3 + 10;
+static constexpr int kProgY = kInfoY + kInfoH + 8;
+static constexpr int kProgH = kBoxHeaderH + 28;
+static constexpr int kActY  = kProgY + kProgH + 8;
+static constexpr int kActH  = kBoxHeaderH + kLineH * 3 + 10;
+
+static void clearBoxBody(int y, int h) {
+  tft.fillRect(kBoxX + 2, y + kBoxHeaderH, kBoxW - 4, h - kBoxHeaderH - 2, FEATURE_BG);
+}
+
+static void drawTitleStrip() {
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+  tft.setTextColor(UI_ICON, FEATURE_BG);
+  tft.setCursor(kPadX, kBodyTop + 6);
+  tft.print("Copy Controller");
+  tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+  tft.setCursor(kPadX, kBodyTop + 18);
+  String name = s_controllerName;
+  if (name.length() > 28) name = name.substring(0, 28);
+  tft.print(name);
+}
+
+static void drawStatusContent() {
+  clearBoxBody(kInfoY, kInfoH);
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+
+  tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+  tft.setCursor(kPadX, kInfoY + kBoxHeaderH + 2);
+  tft.print("Step:");
+  tft.setTextColor(UI_TEXT, FEATURE_BG);
+  tft.setCursor(50, kInfoY + kBoxHeaderH + 2);
+  if (allSlotsDone()) {
+    tft.print("Ready to save");
+  } else {
+    tft.printf("%d / %d  (%s)", s_currentKey + 1, kMaxKeys, kKeyLabels[s_currentKey]);
+  }
+
+  tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+  tft.setCursor(kPadX, kInfoY + kBoxHeaderH + 2 + kLineH);
+  tft.print("Proto:");
+  tft.setTextColor(UI_TEXT, FEATURE_BG);
+  tft.setCursor(50, kInfoY + kBoxHeaderH + 2 + kLineH);
+  if (s_protoLocked) {
+    String pname = typeToString(s_lockedProto);
+    if (!pname.length()) pname = "UNKNOWN";
+    tft.print(pname);
+    tft.print(' ');
+    tft.print((unsigned)s_lockedBits);
+    tft.print("-bit");
+  } else {
+    tft.print("-");
+  }
+
+  tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+  tft.setCursor(kPadX, kInfoY + kBoxHeaderH + 2 + kLineH * 2);
+  tft.print("Saved:");
+  tft.setTextColor(UI_TEXT, FEATURE_BG);
+  tft.setCursor(50, kInfoY + kBoxHeaderH + 2 + kLineH * 2);
+  tft.printf("%d key%s", capturedCount(), capturedCount() == 1 ? "" : "s");
+}
+
+static void drawCaptureContent() {
+  clearBoxBody(kActY, kActH);
+  tft.setTextFont(1);
+  tft.setTextSize(1);
+
+  tft.setTextColor(s_hasCapture ? UI_OK : (allSlotsDone() ? UI_OK : UI_WARN), FEATURE_BG);
+  tft.setCursor(kPadX, kActY + kBoxHeaderH + 2);
+  if (allSlotsDone()) {
+    tft.print("All slots complete");
+  } else if (s_hasCapture) {
+    String pname = typeToString(s_captureProto);
+    if (!pname.length()) pname = "UNKNOWN";
+    tft.print("Got ");
+    tft.print(pname);
+    tft.print(" | ");
+    tft.print((unsigned)s_captureBits);
+    tft.print(" bits");
+  } else {
+    tft.print("Waiting for IR signal...");
+  }
+
+  tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+  tft.setCursor(kPadX, kActY + kBoxHeaderH + 2 + kLineH);
+  if (allSlotsDone()) {
+    tft.print("Save writes /ir or /ir_profiles");
+  } else if (s_hasCapture) {
+    tft.print("Save key, Redo, or Skip");
+  } else {
+    tft.print("Aim remote at DIV IR receiver");
+  }
+
+  tft.setCursor(kPadX, kActY + kBoxHeaderH + 2 + kLineH * 2);
+  if (featureHasTouchNavBar()) {
+    if (allSlotsDone()) {
+      tft.print("Nav: Save | Exit");
+    } else if (s_hasCapture) {
+      tft.print("Nav: Skip | Redo | Save | Exit");
+    } else {
+      tft.print(capturedCount() > 0 ? "Nav: Skip | Done | Exit" : "Nav: Skip | Exit");
+    }
+  } else {
+    tft.print("Use on-screen buttons below");
+  }
+}
+
+// Full: paint chrome once. Partial: only Status / Progress / Capture interiors.
+static void drawUI(bool fullRedraw = true) {
+  if (fullRedraw) {
+    if (featureHasTouchNavBar()) {
+      // Clear only under the status bar so the bar itself doesn't flash.
+      const int bottom = irContentBottom();
+      if (bottom > 20) {
+        tft.fillRect(0, 20, 240, bottom - 20, FEATURE_BG);
+      }
+    } else {
+      tft.fillScreen(FEATURE_BG);
+    }
+    currentBatteryVoltage = readBatteryVoltage();
+    drawStatusBar(currentBatteryVoltage, true);
+    drawToolbar();
+    drawTitleStrip();
+    drawLabeledBox(kInfoY, kInfoH, "Status");
+    drawLabeledBox(kProgY, kProgH, "Progress");
+    drawLabeledBox(kActY, kActH, "Capture");
+    s_navMode = 255;
+  }
+
+  drawStatusContent();
+  drawProgressBar(kPadX, kProgY + kBoxHeaderH + 6, 220, 12, s_currentKey, kMaxKeys);
+  drawCaptureContent();
+  drawActionButtons();
+  applyNavLabels();
+  if (fullRedraw) {
+    irRedrawNavChrome();
+  }
+  s_uiDrawn = true;
+}
+
+static void clearCapture() {
+  s_hasCapture = false;
+  s_captureProto = decode_type_t::UNKNOWN;
+  s_captureBits = 0;
+  s_captureValue = 0;
+}
+
+static void pollCapture() {
+  if (!s_recv.decode(&s_results)) return;
+
+  const decode_type_t proto = s_results.decode_type;
+  const uint16_t bits = s_results.bits;
+  const uint64_t value = s_results.value;
+  s_recv.resume();
+
+  if (proto == decode_type_t::UNKNOWN || bits == 0) return;
+
+  if (s_protoLocked) {
+    if (proto != s_lockedProto) {
+      showNotification("IR Copy", "Protocol mismatch — same remote only");
+      return;
+    }
+  } else {
+    s_lockedProto = proto;
+    s_lockedBits = bits;
+    s_protoLocked = true;
+  }
+
+  s_captureProto = proto;
+  s_captureBits = bits;
+  s_captureValue = value;
+  s_hasCapture = true;
+  drawUI(false);
+}
+
+static void saveCurrentKey() {
+  if (!s_hasCapture || allSlotsDone()) return;
+  s_keys[s_currentKey].has = true;
+  s_keys[s_currentKey].proto = s_captureProto;
+  s_keys[s_currentKey].bits = s_captureBits;
+  s_keys[s_currentKey].code = s_captureValue;
+  clearCapture();
+  s_currentKey++;
+  drawUI(false);
+}
+
+static void skipKey() {
+  if (allSlotsDone()) return;
+  if (s_hasCapture) {
+    showNotification("IR Copy", "Save or redo capture first");
+    return;
+  }
+  s_keys[s_currentKey].has = false;
+  s_currentKey++;
+  drawUI(false);
+}
+
+static void redoKey() {
+  if (!s_hasCapture || allSlotsDone()) return;
+  clearCapture();
+  drawUI(false);
+}
+
+static void finishEarly() {
+  if (s_hasCapture) {
+    showNotification("IR Copy", "Save or redo capture first");
+    return;
+  }
+  if (capturedCount() == 0) {
+    showNotification("IR Copy", "Capture at least one key");
+    return;
+  }
+  s_currentKey = kMaxKeys;
+  drawUI(false);
+}
+
+static bool ensureDir(const char* path) {
+  if (!path || !path[0]) return false;
+  if (SD.exists(path)) {
+    File f = SD.open(path);
+    const bool ok = f && f.isDirectory();
+    if (f) f.close();
+    if (ok) return true;
+    // Name exists but isn't a folder — treat as failure so caller can fall back.
+    return false;
+  }
+  if (SD.mkdir(path)) return true;
+  if (path[0] == '/') return SD.mkdir(path + 1);
+  return false;
+}
+
+// Prefer /ir first — same folder IR Record uses successfully on this board.
+static bool pickSaveDir(String& outDir, String* errOut = nullptr) {
+  restoreSdAfterSharedSpi();
+  if (!isSDCardAvailable()) {
+    if (errOut) *errOut = "SD not available";
+    return false;
+  }
+
+  static const char* kDirs[] = {
+      "/ir", "ir",
+      "/ir_profiles", "ir_profiles",
+      "/profiles", "profiles"};
+  for (size_t i = 0; i < sizeof(kDirs) / sizeof(kDirs[0]); i++) {
+    if (ensureDir(kDirs[i])) {
+      outDir = (kDirs[i][0] == '/') ? String(kDirs[i]) : (String("/") + kDirs[i]);
+      return true;
+    }
+  }
+
+  // Root is always writable if the card mounts — skip mkdir.
+  outDir = "";
+  return true;
+}
+
+static String sanitizeFileStem(const String& name) {
+  String out;
+  out.reserve(name.length());
+  for (int i = 0; i < (int)name.length(); i++) {
+    char c = name[i];
+    if (c == ' ' || c == '/' || c == '\\') c = '_';
+    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+        (c >= '0' && c <= '9') || c == '_' || c == '-') {
+      out += c;
+    }
+  }
+  if (!out.length()) out = "custom";
+  if (out.length() > 20) out = out.substring(0, 20);
+  return out;
+}
+
+static bool writeJsonFile(const String& path, const DynamicJsonDocument& doc) {
+  if (SD.exists(path)) SD.remove(path);
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) {
+    // Some cores want "w" explicitly.
+    f = SD.open(path.c_str(), "w");
+  }
+  if (!f) return false;
+  const size_t n = serializeJson(doc, f);
+  f.flush();
+  f.close();
+  return n > 0;
+}
+
+static bool saveControllerToSD() {
+  String dir;
+  String sdErr;
+  if (!pickSaveDir(dir, &sdErr)) {
+    showNotification("IR Copy", sdErr.c_str());
+    return false;
+  }
+
+  const int captured = capturedCount();
+  if (captured == 0) {
+    showNotification("IR Copy", "No keys captured");
+    return false;
+  }
+  if (!s_protoLocked) {
+    showNotification("IR Copy", "No protocol locked");
+    return false;
+  }
+
+  const char* tok = protocolToken(s_lockedProto);
+  String protoName = tok ? String(tok) : String(typeToString(s_lockedProto));
+  if (!protoName.length() || protoName.equalsIgnoreCase("UNKNOWN")) {
+    protoName = String((int)s_lockedProto);
+  }
+
+  DynamicJsonDocument doc(3072);
+  doc["name"] = s_controllerName;
+  doc["protocol"] = protoName;
+  doc["protocol_id"] = (int)s_lockedProto;
+  doc["bits"] = s_lockedBits;
+  doc["category"] = "CUSTOM";
+  doc["brand"] = "CUSTOM";
+  doc["source"] = "custom";
+
+  uint64_t codes[kIrCustomKeySlots]{};
+  bool hasKeys[kIrCustomKeySlots]{};
+
+  JsonObject codesObj = doc.createNestedObject("codes");
+  for (int i = 0; i < kMaxKeys && i < kIrCustomKeySlots; i++) {
+    if (!s_keys[i].has) continue;
+    if (s_keys[i].proto != s_lockedProto) continue;
+    String keyName = String(kKeyNames[i]);
+    keyName.toLowerCase();
+    char hexStr[24];
+    snprintf(hexStr, sizeof(hexStr), "0x%llX", (unsigned long long)s_keys[i].code);
+    codesObj[keyName] = hexStr;
+    codes[i] = s_keys[i].code;
+    hasKeys[i] = true;
+  }
+
+  // Always keep a RAM copy so Universal can show it even if SD scan fails.
+  irRamCustomRemember(s_controllerName.c_str(), s_lockedProto, s_lockedBits, codes, hasKeys);
+
+  const String stem = sanitizeFileStem(s_controllerName);
+  String path;
+  if (dir.length()) {
+    path = dir + "/prof_" + stem + ".json";
+  } else {
+    path = "/ir_cust_" + stem + ".json";
+  }
+
+  String finalPath = path;
+  int counter = 1;
+  while (SD.exists(finalPath)) {
+    if (dir.length()) {
+      finalPath = dir + "/prof_" + stem + "_" + String(counter++) + ".json";
+    } else {
+      finalPath = "/ir_cust_" + stem + "_" + String(counter++) + ".json";
+    }
+  }
+
+  bool wrote = writeJsonFile(finalPath, doc);
+  if (!wrote) {
+    restoreSdAfterSharedSpi();
+    if (!isSDCardAvailable()) {
+      // RAM cache still has the profile for this session.
+      showNotification("IR Copy", "Saved in RAM (SD fail)");
+      return true;
+    }
+    wrote = writeJsonFile(finalPath, doc);
+  }
+  if (!wrote) {
+    finalPath = "/irc.json";
+    wrote = writeJsonFile(finalPath, doc);
+  }
+
+  // Canonical Copy Controller path (do NOT touch /ir_profiles.json — that file
+  // is the user-managed multi-profile library and must never be overwritten).
+  ensureDir("/ir");
+  writeJsonFile(String(kIrUnivCustomPath), doc);
+  writeJsonFile(String(kIrUnivCustomRoot), doc);
+
+  if (!wrote) {
+    showNotification("IR Copy", "SD write failed; RAM ok");
+    return true;  // Universal can still use RAM cache this session
+  }
+
+  char msg[72];
+  snprintf(msg, sizeof(msg), "Saved %s (%d)", finalPath.c_str(), captured);
+  showNotification("IR Copy", msg);
+  return true;
+}
+
+static void resetState() {
+  s_currentKey = 0;
+  clearCapture();
+  s_protoLocked = false;
+  s_lockedProto = decode_type_t::UNKNOWN;
+  s_lockedBits = 0;
+  s_lastBtnMs = 0;
+  s_prevLeft = s_prevRight = s_prevUp = s_prevDown = s_prevSelect = false;
+  s_uiDrawn = false;
+  s_exitAfterNotif = false;
+  s_navMode = 255;
+  for (int i = 0; i < kMaxKeys; i++) {
+    s_keys[i] = CapturedKey{};
+  }
+}
+
+static void doSaveAction() {
+  if (allSlotsDone()) {
+    if (saveControllerToSD()) {
+      s_exitAfterNotif = true;  // leave after user closes the success toast
+    }
+    return;
+  }
+  if (s_hasCapture) {
+    saveCurrentKey();
+    return;
+  }
+  finishEarly();
+}
+
+static void handleTouchNav() {
+  if (!featureHasTouchNavBar()) return;
+
+  // Labels: left, down, center, up, right
+  if (isTouchNavButtonPressedEdge(BTN_SELECT)) {
+    feature_exit_requested = true;
+    return;
+  }
+  if (isTouchNavButtonPressedEdge(BTN_LEFT)) {
+    skipKey();
+    return;
+  }
+  if (isTouchNavButtonPressedEdge(BTN_UP)) {
+    redoKey();
+    return;
+  }
+  if (isTouchNavButtonPressedEdge(BTN_RIGHT)) {
+    doSaveAction();
+    return;
+  }
+  if (isTouchNavButtonPressedEdge(BTN_DOWN)) {
+    // "Done" while waiting — jump to save screen.
+    if (!allSlotsDone() && !s_hasCapture) finishEarly();
+  }
+}
+
+static void handlePhysicalButtons() {
+  const uint32_t now = millis();
+  const bool leftNow = isPhysicalButtonPressed(BTN_LEFT);
+  const bool rightNow = isPhysicalButtonPressed(BTN_RIGHT);
+  const bool upNow = isPhysicalButtonPressed(BTN_UP);
+  const bool downNow = isPhysicalButtonPressed(BTN_DOWN);
+  const bool selectNow = isPhysicalButtonPressed(BTN_SELECT);
+
+  if ((uint32_t)(now - s_lastBtnMs) > kBtnDebounceMs) {
+    if (selectNow && !s_prevSelect) {
+      feature_exit_requested = true;
+      s_lastBtnMs = now;
+    } else if (leftNow && !s_prevLeft) {
+      skipKey();
+      s_lastBtnMs = now;
+    } else if (upNow && !s_prevUp) {
+      redoKey();
+      s_lastBtnMs = now;
+    } else if (rightNow && !s_prevRight) {
+      doSaveAction();
+      s_lastBtnMs = now;
+    } else if (downNow && !s_prevDown) {
+      if (!allSlotsDone() && !s_hasCapture) {
+        finishEarly();
+        s_lastBtnMs = now;
+      }
+    }
+  }
+
+  s_prevLeft = leftNow;
+  s_prevRight = rightNow;
+  s_prevUp = upNow;
+  s_prevDown = downNow;
+  s_prevSelect = selectNow;
+}
+
+static void handleToolbarAndScreenTouch() {
+  static bool touchWasDown = false;
+  static uint32_t lastTouchMs = 0;
+  const uint32_t now = millis();
+  const bool touchNow = isTouchDownDismiss();
+
+  if (touchNow && !touchWasDown) {
+    touchWasDown = true;
+    int x, y;
+    if (!readTouchXY(x, y)) return;
+    if ((uint32_t)(now - lastTouchMs) < kBtnDebounceMs) return;
+    lastTouchMs = now;
+
+    // Toolbar back
+    if (y > kToolbarY && y < kToolbarBottom &&
+        x > kIconBackX && x < (kIconBackX + kIconSize)) {
+      feature_exit_requested = true;
+      return;
+    }
+
+    if (!featureHasTouchNavBar()) {
+      layoutActionButtons();
+      const int hit = FeatureUI::hit(s_actionBtns, 3, x, y);
+      if (hit == 0) skipKey();
+      else if (hit == 1) redoKey();
+      else if (hit == 2) doSaveAction();
+    }
+  }
+  if (!touchNow) touchWasDown = false;
+}
+
+void setup() {
+  setTouchButtonInputEnabled(false);
+
+  OnScreenKeyboardConfig cfg;
+  cfg.titleLine1 = "Enter controller name";
+  cfg.titleLine2 = "(max 20 chars)";
+  osKeyboardUseStandardLayout(cfg);
+  cfg.maxLen = 20;
+  cfg.buttonsY = 195;
+  cfg.backLabel = "Cancel";
+  cfg.middleLabel = "Clear";
+  cfg.okLabel = "OK";
+  cfg.requireNonEmpty = true;
+  cfg.emptyErrorMsg = "Name cannot be empty!";
+  const char* shuffleNames[] = {"TV", "AC", "Lamp", "Receiver", "Projector", "Soundbar"};
+  cfg.shuffleNames = shuffleNames;
+  cfg.shuffleCount = 6;
+  cfg.enableShuffle = true;
+
+  OnScreenKeyboardResult r = showOnScreenKeyboard(cfg, "");
+  if (!r.accepted) {
+    feature_exit_requested = true;
+    return;
+  }
+  s_controllerName = r.text;
+
+  pinMode(IR_RX_PIN, INPUT_PULLUP);
+  resetState();
+  s_recv.enableIRIn();
+
+  setTouchButtonInputEnabled(true);
+  drawUI();
+}
+
+void loop() {
+  if (feature_active && (feature_exit_requested || featureExitButtonPressed())) {
+    feature_exit_requested = true;
+    return;
+  }
+
+  // Notifications must be dismissed before other input (same pattern as SubGHz/GPS).
+  if (isNotificationVisible()) {
+    maintainTouchNavBar();
+    int nx, ny;
+    bool dismissed = false;
+    if (readTouchXY(nx, ny)) {
+      dismissed = (notificationHandleTouch(nx, ny) != NotificationAction::None);
+    } else if (isPhysicalButtonPressed(BTN_SELECT) ||
+               isTouchNavButtonPressedEdge(BTN_SELECT) ||
+               isTouchNavButtonPressedEdge(BTN_LEFT)) {
+      hideNotification();
+      dismissed = true;
+    }
+    if (dismissed) {
+      // hideNotification only clears a rect — redraw the full feature UI.
+      drawUI();
+      if (s_exitAfterNotif) feature_exit_requested = true;
+    }
+    delay(10);
+    return;
+  }
+  if (s_exitAfterNotif) {
+    feature_exit_requested = true;
+    return;
+  }
+
+  if (!s_uiDrawn) drawUI();
+
+  // Poll IR before nav chrome so label changes from a new capture are painted
+  // in the same frame by maintainTouchNavBar().
+  if (!allSlotsDone() && !s_hasCapture) {
+    pollCapture();
+  }
+
+  maintainTouchNavBar();
+
+  handleTouchNav();
+  handlePhysicalButtons();
+  handleToolbarAndScreenTouch();
+  delay(10);
+}
+
+}  // namespace IRCopyController
+
+namespace IRUniversalAC {
+
+static constexpr const char* AC_DIR    = "/ir_ac";
+static constexpr const char* AC_RECENT = "/ir_ac/recent.txt";
+
+static constexpr int16_t kToolbarY = 20;
+static constexpr int16_t kToolbarH = 16;
+static constexpr int16_t kIconSize = 16;
+static constexpr int kToolbarBottom = kToolbarY + kToolbarH;  // 36
+static constexpr int kBodyTop = kToolbarBottom + 1;           // 37
+static constexpr int kPadX = 10;
+static constexpr int kIconBackX = 10;
+static constexpr int kIconReloadX = 210;
+static constexpr int LIST_ROW_H = 20;
+
+static IRLgAc s_lg(IR_TX_PIN);
+static IRsend s_rawSend(IR_TX_PIN);   // for direct commands (swing by position, light)
+static int s_swingIdx = -1;           // -1 = nenhuma posicao enviada ainda
+
+static uint32_t parseHex32(const char* s) {
+  if (!s) return 0;
+  String t(s); t.trim();
+  if (t.startsWith("0x") || t.startsWith("0X")) return (uint32_t)strtoul(t.c_str() + 2, nullptr, 16);
+  return (uint32_t)strtoul(t.c_str(), nullptr, 16);
+}
+static decode_type_t protoFromStr(const String& s, decode_type_t def) {
+  String u = s; u.toUpperCase();
+  if (u == "LG")  return decode_type_t::LG;
+  if (u == "LG2") return decode_type_t::LG2;
+  return def;
+}
+
+// ---------- modelos LG ----------
+static const lg_ac_remote_model_t kLgModels[] = {
+  AKB75215403, AKB74955603, AKB73757604, GE6711AR2853M, LG6711A20083V
+};
+static constexpr int kLgModelCount = sizeof(kLgModels) / sizeof(kLgModels[0]);
+
+static const char* lgModelName(lg_ac_remote_model_t m) {
+  switch (m) {
+    case AKB75215403:   return "AKB75215403";
+    case AKB74955603:   return "AKB74955603";
+    case AKB73757604:   return "AKB73757604";
+    case GE6711AR2853M: return "GE6711AR2853M";
+    case LG6711A20083V: return "LG6711A20083V";
+    default:            return "AKB75215403";
+  }
+}
+
+static lg_ac_remote_model_t lgModelFromString(const String& in) {
+  String s = in; s.toUpperCase();
+  if (s.indexOf("GE6711") >= 0)   return GE6711AR2853M;
+  if (s.indexOf("20083") >= 0)    return LG6711A20083V;
+  if (s.indexOf("74955603") >= 0) return AKB74955603;
+  if (s.indexOf("73757604") >= 0) return AKB73757604;
+  if (s.indexOf("75215403") >= 0) return AKB75215403;
+  return AKB75215403;  // default (inclui o AKB75215424 do usuario)
+}
+
+static const char* lgProtoName(lg_ac_remote_model_t m) {
+  return (m == GE6711AR2853M || m == LG6711A20083V) ? "LG" : "LG2";
+}
+
+// ---------- perfis ----------
+struct AcProfile {
+  String name;
+  String brand;
+  String model;
+  bool fromSd = false;
+  lg_ac_remote_model_t lgModel = AKB75215403;
+  std::vector<uint32_t> swingCodes;               // vane positions, in order
+  decode_type_t swingProto = decode_type_t::LG2;  // protocolo p/ enviar swing
+  uint32_t lightCode = 0x88C00A6;                 // display light toggle
+  decode_type_t lightProto = decode_type_t::LG2;
+};
+
+// Fills in default (library) swing/light codes; the SD card can override them.
+static void setAcDefaults(AcProfile& p) {
+  static const uint32_t def[] = {
+    kLgAcSwingVLowest, kLgAcSwingVLow, kLgAcSwingVMiddle,
+    kLgAcSwingVUpperMiddle, kLgAcSwingVHigh, kLgAcSwingVHighest,
+    kLgAcSwingVSwing, kLgAcSwingVOff
+  };
+  p.swingCodes.assign(def, def + (sizeof(def) / sizeof(def[0])));
+  p.swingProto = decode_type_t::LG2;
+  p.lightCode = kLgAcLightToggle;
+  p.lightProto = decode_type_t::LG2;
+}
+static std::vector<AcProfile> s_profs;
+static int s_profIdx = 0;
+static int s_sdCount = 0;
+static bool s_loadedSd = false;
+static String s_lastErr;
+
+static void loadBuiltinAc() {
+  auto add = [&](const char* n, const char* model) {
+    AcProfile p;
+    p.name = n; p.brand = "LG"; p.model = model; p.fromSd = false;
+    p.lgModel = lgModelFromString(model);
+    setAcDefaults(p);
+    s_profs.push_back(p);
+  };
+  add("LG Dual Inverter",        "AKB75215403");
+  add("LG (AKB75215403)",        "AKB75215403");
+  add("LG (AKB74955603)",        "AKB74955603");
+  add("LG (AKB73757604)",        "AKB73757604");
+  add("LG (GE6711AR2853M)",      "GE6711AR2853M");
+  add("LG (LG6711A20083V)",      "LG6711A20083V");
+}
+
+static bool loadAcFromSd() {
+  s_sdCount = 0;
+  if (!isSDCardAvailable()) return false;
+  if (!SD.exists(AC_DIR)) return false;
+  File d = SD.open(AC_DIR);
+  if (!d) return false;
+  for (;;) {
+    File f = d.openNextFile();
+    if (!f) break;
+    if (!f.isDirectory()) {
+      String name = String(f.name());
+      if (name.endsWith(".json")) {
+        DynamicJsonDocument doc(2048);
+        if (!deserializeJson(doc, f)) {
+          JsonObject o = doc.as<JsonObject>();
+          String brand = String((const char*)(o["brand"] | ""));
+          brand.toUpperCase();
+          if (brand.length() == 0 || brand == "LG") {  // so LG por enquanto
+            AcProfile p;
+            p.name  = String((const char*)(o["name"]  | ""));
+            p.brand = "LG";
+            p.model = String((const char*)(o["model"] | "AKB75215403"));
+            p.fromSd = true;
+            p.lgModel = lgModelFromString(p.model);
+            if (!p.name.length()) p.name = String("LG ") + p.model;
+            setAcDefaults(p);
+            p.swingProto = protoFromStr(String((const char*)(o["swing_proto"] | "")), p.swingProto);
+            p.lightProto = protoFromStr(String((const char*)(o["light_proto"] | "")), p.lightProto);
+            if (o.containsKey("light")) { uint32_t lc = parseHex32(o["light"] | ""); if (lc) p.lightCode = lc; }
+            JsonArray sw = o["swing"].as<JsonArray>();
+            if (!sw.isNull()) {
+              std::vector<uint32_t> codes;
+              for (JsonVariant v : sw) { uint32_t c = parseHex32(v.as<const char*>()); if (c) codes.push_back(c); }
+              if (!codes.empty()) p.swingCodes = codes;
+            }
+            s_profs.push_back(p);
+            s_sdCount++;
+          }
+        }
+      }
+    }
+    f.close();
+    if ((int)s_profs.size() >= 200) break;
+  }
+  d.close();
+  return s_sdCount > 0;
+}
+
+static void refreshAc() {
+  s_profs.clear();
+  loadBuiltinAc();
+  s_loadedSd = loadAcFromSd();
+  s_lastErr = s_loadedSd ? (String(s_sdCount) + " do SD") : String("SD: nenhum");
+  if (s_profIdx < 0 || s_profIdx >= (int)s_profs.size()) s_profIdx = 0;
+}
+
+// ---------- estado do A/C ----------
+struct AcState {
+  bool power = false;
+  uint8_t mode = kLgAcCool;
+  uint8_t temp = 22;
+  uint8_t fan = kLgAcFanAuto;
+  bool swingV = false;
+  bool light = true;
+};
+static AcState s_st;
+
+static const uint8_t kFanCycle[] = { kLgAcFanAuto, kLgAcFanLow, kLgAcFanMedium, kLgAcFanMax };
+static constexpr int kFanCycleCount = sizeof(kFanCycle) / sizeof(kFanCycle[0]);
+
+static const char* fanName(uint8_t f) {
+  switch (f) {
+    case kLgAcFanAuto:   return "Auto";
+    case kLgAcFanLow:    return "Low";
+    case kLgAcFanMedium: return "Med";
+    case kLgAcFanMax:    return "Max";
+    case kLgAcFanLowest: return "Min";
+    case kLgAcFanHigh:   return "High";
+    default:             return "?";
+  }
+}
+static const char* modeName(uint8_t m) {
+  switch (m) {
+    case kLgAcCool: return "Cool";
+    case kLgAcDry:  return "Dry";
+    case kLgAcFan:  return "Fan";
+    case kLgAcAuto: return "Auto";
+    case kLgAcHeat: return "Heat";
+    default:        return "?";
+  }
+}
+
+static void acApplyAndSend() {
+  if (s_profs.empty()) return;
+  const AcProfile& p = s_profs[s_profIdx];
+  s_lg.setModel(p.lgModel);
+  s_lg.setPower(s_st.power);
+  s_lg.setMode(s_st.mode);
+  s_lg.setTemp(s_st.temp);
+  s_lg.setFan(s_st.fan);
+  // Swing and light are sent as a direct command (see acButton), not here.
+  s_lg.send();
+}
+
+// ---------- botoes do controle ----------
+enum AcBtn { B_PWR, B_MODE, B_TEMPUP, B_TEMPDN, B_SWING, B_SPEED, B_LIGHT, B_COUNT };
+static FeatureUI::Button s_btn[B_COUNT];
+
+static void acButton(int b) {
+  switch (b) {
+    case B_PWR:    s_st.power = !s_st.power; break;
+    case B_MODE:   s_st.power = true; s_st.mode = (uint8_t)((s_st.mode + 1) % 5); break;
+    case B_TEMPUP: s_st.power = true; if (s_st.temp < kLgAcMaxTemp) s_st.temp++; break;
+    case B_TEMPDN: s_st.power = true; if (s_st.temp > kLgAcMinTemp) s_st.temp--; break;
+    case B_SWING: {
+      s_st.power = true;
+      const AcProfile& p = s_profs[s_profIdx];
+      if (p.swingCodes.empty()) return;
+      s_swingIdx = (s_swingIdx + 1) % (int)p.swingCodes.size();
+      s_rawSend.send(p.swingProto, p.swingCodes[s_swingIdx], kLgBits);
+      return;  // direct command, doesn't resend the full state
+    }
+    case B_SPEED: {
+      s_st.power = true;
+      int i = 0; for (; i < kFanCycleCount; i++) if (kFanCycle[i] == s_st.fan) break;
+      if (i >= kFanCycleCount) i = -1;
+      s_st.fan = kFanCycle[(i + 1) % kFanCycleCount];
+      break;
+    }
+    case B_LIGHT: {
+      const AcProfile& p = s_profs[s_profIdx];
+      if (p.lightCode) s_rawSend.send(p.lightProto, p.lightCode, kLgBits);
+      return;  // direct toggle of the display light
+    }
+  }
+  acApplyAndSend();
+}
+
+// ---------- telas: estado de lista ----------
+enum class AScreen : uint8_t { List, Details, Control };
+static AScreen s_scr = AScreen::List;
+
+static std::vector<int> s_order;
+static std::vector<String> s_recentNames;
+static std::vector<int> s_recent;
+struct Row { int idx; bool header; const char* label; };
+static std::vector<Row> s_rows;
+static int s_sel = 0, s_top = 0, s_selProf = 0;
+static int s_navSel = 0;   // botao do controle selecionado (tela Control)
+static bool s_drawn = false;
+
+static int listTopY()   { return kBodyTop + 6; }
+static int listBottom() { return irContentBottom() - 4; }
+static int listRows()   { int r = (listBottom() - listTopY()) / LIST_ROW_H; return r < 1 ? 1 : r; }
+
+static String acTrunc(const String& s, int maxPx) {
+  if (maxPx <= 0 || !s.length()) return s;
+  if ((int)tft.textWidth(s, 1) <= maxPx) return s;
+  const int ell = tft.textWidth("...", 1);
+  String o = s;
+  while (o.length() && (int)tft.textWidth(o, 1) + ell > maxPx) o.remove(o.length() - 1);
+  return o + "...";
+}
+
+// ---------- recentes ----------
+static void loadRecentNames() {
+  s_recentNames.clear();
+  if (!isSDCardAvailable()) return;
+  File f = SD.open(AC_RECENT, FILE_READ);
+  if (!f) return;
+  while (f.available() && (int)s_recentNames.size() < 3) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length()) s_recentNames.push_back(line);
+  }
+  f.close();
+}
+static void saveRecentNames() {
+  if (!isSDCardAvailable()) return;
+  if (!SD.exists(AC_DIR)) SD.mkdir(AC_DIR);
+  if (SD.exists(AC_RECENT)) SD.remove(AC_RECENT);
+  File f = SD.open(AC_RECENT, FILE_WRITE);
+  if (!f) return;
+  for (auto& n : s_recentNames) f.println(n);
+  f.close();
+}
+static void pushRecent(const String& name) {
+  if (!name.length()) return;
+  for (int i = 0; i < (int)s_recentNames.size(); i++)
+    if (s_recentNames[i] == name) { s_recentNames.erase(s_recentNames.begin() + i); break; }
+  s_recentNames.insert(s_recentNames.begin(), name);
+  while ((int)s_recentNames.size() > 3) s_recentNames.pop_back();
+  saveRecentNames();
+}
+
+static void rebuildOrder() {
+  s_order.clear();
+  for (int i = 0; i < (int)s_profs.size(); i++) s_order.push_back(i);
+  std::sort(s_order.begin(), s_order.end(), [](int a, int b) {
+    const AcProfile& pa = s_profs[a];
+    const AcProfile& pb = s_profs[b];
+    auto up = [](String s) { s.toUpperCase(); return s; };
+    String x, y;
+    x = up(pa.brand); y = up(pb.brand); if (x != y) return x < y;
+    x = up(pa.model); y = up(pb.model); if (x != y) return x < y;
+    x = up(pa.name);  y = up(pb.name);  return x < y;
+  });
+}
+static void rebuildRecent() {
+  s_recent.clear();
+  for (auto& n : s_recentNames) {
+    for (int i = 0; i < (int)s_profs.size(); i++)
+      if (s_profs[i].name == n) { s_recent.push_back(i); break; }
+    if ((int)s_recent.size() >= 3) break;
+  }
+}
+static int firstSelectable() {
+  for (int i = 0; i < (int)s_rows.size(); i++) if (!s_rows[i].header) return i;
+  return 0;
+}
+static void rebuildRows() {
+  s_rows.clear();
+  if (!s_recent.empty()) {
+    s_rows.push_back({ -1, true, "Recentes" });
+    for (int idx : s_recent) s_rows.push_back({ idx, false, nullptr });
+    s_rows.push_back({ -1, true, "Todos" });
+  }
+  for (int idx : s_order) s_rows.push_back({ idx, false, nullptr });
+  if (s_sel < 0 || s_sel >= (int)s_rows.size() || s_rows[s_sel].header) s_sel = firstSelectable();
+}
+static void moveSel(int dir) {
+  int n = (int)s_rows.size();
+  if (n == 0) return;
+  int i = s_sel + dir;
+  while (i >= 0 && i < n && s_rows[i].header) i += dir;
+  if (i < 0 || i >= n) return;
+  s_sel = i;
+}
+static void ensureVisible() {
+  int rows = listRows();
+  if (s_sel < s_top) s_top = s_sel;
+  if (s_sel >= s_top + rows) s_top = s_sel - rows + 1;
+  if (s_top < 0) s_top = 0;
+}
+
+// ---------- desenho ----------
+static void drawToolbar() {
+  tft.fillRect(0, kToolbarY, 240, kToolbarH, UI_FG);
+  tft.drawBitmap(kIconBackX, kToolbarY, bitmap_icon_go_back, kIconSize, kIconSize, UI_ICON);
+  if (s_scr != AScreen::Details)
+    tft.drawBitmap(kIconReloadX, kToolbarY, bitmap_icon_undo, kIconSize, kIconSize, UI_ICON);
+  tft.drawFastHLine(0, kToolbarBottom, 240, UI_LINE);
+}
+
+static void drawList() {
+  tft.fillRect(0, kBodyTop, 240, irContentBottom() - kBodyTop, FEATURE_BG);
+  tft.setTextFont(1); tft.setTextSize(1);
+  if (s_rows.empty()) {
+    tft.setTextColor(UI_WARN, FEATURE_BG);
+    tft.setCursor(kPadX, listTopY() + 4);
+    tft.print("Sem controles A/C");
+    return;
+  }
+  ensureVisible();
+  const int rows = listRows();
+  const int baseY = listTopY();
+  const int innerW = 240 - 2 * kPadX;
+  for (int r = 0; r < rows; r++) {
+    const int ri = s_top + r;
+    if (ri >= (int)s_rows.size()) break;
+    const Row& row = s_rows[ri];
+    const int ry = baseY + r * LIST_ROW_H;
+    if (row.header) {
+      tft.setTextColor(UI_ICON, FEATURE_BG);
+      tft.setCursor(kPadX, ry + 6);
+      tft.print(row.label);
+      tft.drawFastHLine(kPadX, ry + LIST_ROW_H - 2, innerW, UI_LINE);
+      continue;
+    }
+    const AcProfile& p = s_profs[row.idx];
+    const bool sel = (ri == s_sel);
+    const uint16_t bg = sel ? UI_FG : FEATURE_BG;
+    const uint16_t fg = sel ? UI_ICON : UI_TEXT;
+    tft.fillRect(kPadX, ry, innerW, LIST_ROW_H - 1, bg);
+    const char* tag = p.fromSd ? "SD" : "BI";
+    const int tagW = tft.textWidth(tag, 1);
+    tft.setTextColor(p.fromSd ? UI_OK : UI_DIM_TEXT, bg);
+    tft.setCursor(kPadX + innerW - tagW - 2, ry + 6);
+    tft.print(tag);
+    tft.setTextColor(fg, bg);
+    tft.setCursor(kPadX + 4, ry + 6);
+    tft.print(acTrunc(p.name, innerW - tagW - 14));
+  }
+}
+
+static void drawDetails() {
+  tft.fillRect(0, kBodyTop, 240, irContentBottom() - kBodyTop, FEATURE_BG);
+  if (s_selProf < 0 || s_selProf >= (int)s_profs.size()) return;
+  const AcProfile& p = s_profs[s_selProf];
+  tft.setTextFont(1); tft.setTextSize(1);
+  int y = kBodyTop + 8;
+  const int step = 18;
+  const int valX = kPadX + 80;
+  auto line = [&](const char* label, const String& val, uint16_t vc) {
+    tft.setTextColor(UI_DIM_TEXT, FEATURE_BG);
+    tft.setCursor(kPadX, y); tft.print(label);
+    tft.setTextColor(vc, FEATURE_BG);
+    tft.setCursor(valX, y);
+    tft.print(acTrunc(val.length() ? val : String("-"), 240 - valX - kPadX));
+    y += step;
+  };
+  line("Nome:",     p.name, UI_TEXT);
+  line("Marca:",    p.brand, UI_TEXT);
+  line("Modelo:",   String(lgModelName(p.lgModel)), UI_OK);
+  line("Protocolo:",String(lgProtoName(p.lgModel)), UI_TEXT);
+  line("Temp:",     String(kLgAcMinTemp) + "-" + String(kLgAcMaxTemp) + "C", UI_TEXT);
+  line("Modos:",    "Cool/Dry/Fan/Auto/Heat", UI_TEXT);
+  line("Fonte:",    p.fromSd ? String("SD card") : String("Built-in"), p.fromSd ? UI_OK : UI_DIM_TEXT);
+}
+
+// Desenha um botao do controle AC; selecionado = Primary (vermelho, como o PWR).
+static void acDrawBtn(int i, bool sel) {
+  const FeatureUI::Button& b = s_btn[i];
+  FeatureUI::drawButtonRect(b.x, b.y, b.w, b.h, b.label,
+                            sel ? FeatureUI::ButtonStyle::Primary : FeatureUI::ButtonStyle::Secondary,
+                            false, b.disabled, 2);
+}
+
+static void acLayout() {
+  const int top = kBodyTop + 24;
+  const int bottom = irContentBottom() - 6;
+  const int unit = (bottom - top) / 5;
+  const int bh = unit - 6;
+  const int sideW = 80, centerW = 96;
+  const int xL = 8, xR = 240 - 8 - sideW, xC = (240 - centerW) / 2;
+  int y = top;
+  s_btn[B_PWR]    = { (int16_t)xL,(int16_t)y,(int16_t)sideW,(int16_t)bh,"PWR", FeatureUI::ButtonStyle::Primary,  false };
+  s_btn[B_MODE]   = { (int16_t)xR,(int16_t)y,(int16_t)sideW,(int16_t)bh,"MODE",FeatureUI::ButtonStyle::Secondary,false };
+  y += unit;
+  s_btn[B_TEMPUP] = { (int16_t)xC,(int16_t)y,(int16_t)centerW,(int16_t)bh,"TEMP +",FeatureUI::ButtonStyle::Secondary,false };
+  y += unit;
+  s_btn[B_TEMPDN] = { (int16_t)xC,(int16_t)y,(int16_t)centerW,(int16_t)bh,"TEMP -",FeatureUI::ButtonStyle::Secondary,false };
+  y += unit;
+  s_btn[B_SWING]  = { (int16_t)xL,(int16_t)y,(int16_t)sideW,(int16_t)bh,"SWING",FeatureUI::ButtonStyle::Secondary,false };
+  s_btn[B_SPEED]  = { (int16_t)xR,(int16_t)y,(int16_t)sideW,(int16_t)bh,"SPEED",FeatureUI::ButtonStyle::Secondary,false };
+  y += unit;
+  s_btn[B_LIGHT]  = { (int16_t)xC,(int16_t)y,(int16_t)centerW,(int16_t)bh,"LIGHT",FeatureUI::ButtonStyle::Secondary,false };
+}
+
+static void drawControl() {
+  tft.fillRect(0, kBodyTop, 240, irContentBottom() - kBodyTop, FEATURE_BG);
+  if (s_profIdx < 0 || s_profIdx >= (int)s_profs.size()) return;
+  const AcProfile& p = s_profs[s_profIdx];
+  tft.setTextFont(1); tft.setTextSize(1);
+  tft.setTextColor(UI_ICON, FEATURE_BG);
+  tft.setCursor(kPadX, kBodyTop + 3);
+  tft.print(acTrunc(p.name, 240 - 2 * kPadX));
+  String stline = s_st.power
+      ? (String(modeName(s_st.mode)) + "  " + String(s_st.temp) + "C  Fan:" + fanName(s_st.fan)
+         + (s_swingIdx >= 0 ? (String("  Aba#") + String(s_swingIdx + 1)) : String("")))
+      : String("Desligado");
+  tft.setTextColor(s_st.power ? UI_OK : UI_DIM_TEXT, FEATURE_BG);
+  tft.setCursor(kPadX, kBodyTop + 13);
+  tft.print(acTrunc(stline, 240 - 2 * kPadX));
+  acLayout();
+  for (int i = 0; i < B_COUNT; i++) acDrawBtn(i, i == s_navSel);
+}
+
+static void drawFooter() {
+  if (s_scr == AScreen::List)
+    setTouchNavLabels("Voltar", "Baixo", "Load", "Cima", "Detalhes");
+  else if (s_scr == AScreen::Details)
+    setTouchNavLabels("Voltar", "", "", "", "");
+  else
+    setTouchNavLabels("Voltar", "", "OK", "", "");
+  irRedrawNavChrome();
+}
+
+static void drawAll() {
+  irClearBody(FEATURE_BG);
+  drawStatusBar(readBatteryVoltage(), true);
+  drawToolbar();
+  if (s_scr == AScreen::List)         drawList();
+  else if (s_scr == AScreen::Details) drawDetails();
+  else                                drawControl();
+  drawFooter();
+  s_drawn = true;
+}
+
+// ---------- acoes ----------
+static void doReload() {
+  refreshAc();
+  rebuildOrder();
+  rebuildRecent();
+  rebuildRows();
+  s_top = 0;
+  s_drawn = false;
+}
+static void goList()  { s_scr = AScreen::List; s_drawn = false; }
+static void openDetails() {
+  if (s_rows.empty()) return;
+  const Row& row = s_rows[s_sel];
+  if (row.header || row.idx < 0) return;
+  s_selProf = row.idx;
+  s_scr = AScreen::Details;
+  s_drawn = false;
+}
+static void loadSelected() {
+  if (s_rows.empty()) return;
+  const Row& row = s_rows[s_sel];
+  if (row.header || row.idx < 0) return;
+  s_profIdx = row.idx;
+  pushRecent(s_profs[s_profIdx].name);
+  rebuildRecent(); rebuildRows();
+  // reinicia estado ao abrir um controle
+  s_st = AcState();
+  s_swingIdx = -1;
+  s_lg.stateReset();
+  s_lg.setModel(s_profs[s_profIdx].lgModel);
+  s_navSel = 0;   // PWR
+  s_scr = AScreen::Control;
+  s_drawn = false;
+}
+
+static void ctrlGo(int ni) {
+  if (ni < 0 || ni == s_navSel) return;
+  const int o = s_navSel;
+  s_navSel = ni;
+  acDrawBtn(o, false);
+  acDrawBtn(s_navSel, true);
+}
+
+// Navigate the AC control grid.
+// dir: 0=up, 1=down, 2=left, 3=right
+// Returns the index of the nearest button in that direction, or current if none.
+static int irNavSelect(const FeatureUI::Button* btns, int count, int current, int dir) {
+  if (current < 0 || current >= count) return current;
+  const auto& cur = btns[current];
+  const int cx = cur.x + cur.w / 2;
+  const int cy = cur.y + cur.h / 2;
+  int best = current;
+  int bestDist = INT_MAX;
+  for (int i = 0; i < count; i++) {
+    if (i == current) continue;
+    const auto& b = btns[i];
+    const int bx = b.x + b.w / 2;
+    const int by = b.y + b.h / 2;
+    bool candidate = false;
+    int dist = 0;
+    switch (dir) {
+      case 0: candidate = (by < cy); dist = abs(cx - bx) * 3 + (cy - by); break;
+      case 1: candidate = (by > cy); dist = abs(cx - bx) * 3 + (by - cy); break;
+      case 2: candidate = (bx < cx); dist = abs(cy - by) * 3 + (cx - bx); break;
+      case 3: candidate = (bx > cx); dist = abs(cy - by) * 3 + (bx - cx); break;
+    }
+    if (candidate && dist < bestDist) { bestDist = dist; best = i; }
+  }
+  return best;
+}
+
+// Returns true if there is no button to the left of the current one.
+static bool irIsLeftEdge(const FeatureUI::Button* btns, int count, int current) {
+  return irNavSelect(btns, count, current, 2) == current;
+}
+
+static void ctrlNav(int dir) {
+  ctrlGo(irNavSelect(s_btn, (int)B_COUNT, s_navSel, dir));
+}
+
+static void goList();
+static void ctrlLeft() {
+  const int ni = irNavSelect(s_btn, (int)B_COUNT, s_navSel, 2);
+  if (ni != s_navSel) { ctrlGo(ni); return; }
+  if (irIsLeftEdge(s_btn, (int)B_COUNT, s_navSel)) goList();  // so volta na coluna mais a esq
+}
+
+static void ctrlActivate() {
+  if (s_navSel < 0 || s_navSel >= (int)B_COUNT) return;
+  acDrawBtn(s_navSel, true);
+  acButton(s_navSel);
+  delay(90);
+  drawControl();   // atualiza linha de estado + mantem selecao
+}
+
+static bool handleToolbarTouch(int x, int y) {
+  if (y <= kToolbarY || y >= kToolbarBottom) return false;
+  if (x > kIconBackX && x < kIconBackX + kIconSize) {
+    if (s_scr == AScreen::List) feature_exit_requested = true;
+    else goList();
+    return true;
+  }
+  if (s_scr != AScreen::Details && x > kIconReloadX && x < kIconReloadX + kIconSize) {
+    doReload();
+    return true;
+  }
+  return false;
+}
+
+void setup() {
+  setTouchButtonInputEnabled(true);
+  s_lg.begin();
+  s_rawSend.begin();
+  s_scr = AScreen::List;
+  s_profIdx = 0;
+  s_drawn = false;
+  loadRecentNames();
+  refreshAc();
+  rebuildOrder();
+  rebuildRecent();
+  rebuildRows();
+  s_sel = firstSelectable();
+  s_top = 0;
+  drawAll();
+}
+
+void loop() {
+  if (feature_active && feature_exit_requested) {
+    return;
+  }
+  if (!s_drawn) drawAll();
+  maintainTouchNavBar();
+
+  if (s_scr == AScreen::List) {
+    if (isButtonPressedEdge(BTN_UP))     { moveSel(-1); drawList(); }
+    if (isButtonPressedEdge(BTN_DOWN))   { moveSel(+1); drawList(); }
+    if (isButtonPressedEdge(BTN_LEFT))   { feature_exit_requested = true; }   // volta/sai
+    if (isButtonPressedEdge(BTN_RIGHT))  { openDetails(); }
+    if (isButtonPressedEdge(BTN_SELECT)) { loadSelected(); }                  // meio = Load
+  } else if (s_scr == AScreen::Details) {
+    if (isButtonPressedEdge(BTN_LEFT))   { goList(); }
+  } else { // Control: setas movem (espacial); esq no canto = Voltar; meio aciona
+    const bool nUp = isButtonPressedEdge(BTN_UP);
+    const bool nDn = isButtonPressedEdge(BTN_DOWN);
+    const bool nRt = isButtonPressedEdge(BTN_RIGHT);
+    const bool nLf = isButtonPressedEdge(BTN_LEFT);
+    const bool nOk = isButtonPressedEdge(BTN_SELECT);
+    static uint32_t lastNavMs = 0;
+    const uint32_t nowNav = millis();
+    if ((uint32_t)(nowNav - lastNavMs) > 160) {   // anti-bounce (1 acao por toque)
+      if      (nUp) { ctrlNav(0);     lastNavMs = nowNav; }
+      else if (nDn) { ctrlNav(1);     lastNavMs = nowNav; }
+      else if (nRt) { ctrlNav(3);     lastNavMs = nowNav; }
+      else if (nLf) { ctrlLeft();     lastNavMs = nowNav; }
+      else if (nOk) { ctrlActivate(); lastNavMs = nowNav; }
+    }
+  }
+
+  static uint32_t lastTouchMs = 0;
+  static bool touchWas = false;
+  const uint32_t now = millis();
+  const bool touchNow = isTouchDownDismiss();
+  constexpr uint32_t kTouchDebounceMs = 280;
+  if (touchNow && !touchWas) {
+    int x, y;
+    touchWas = true;
+    if (!readTouchXY(x, y)) return;
+    if ((uint32_t)(now - lastTouchMs) < kTouchDebounceMs) return;
+    lastTouchMs = now;
+    if (handleToolbarTouch(x, y)) return;
+
+    if (s_scr == AScreen::List) {
+      const int rows = listRows();
+      const int ty = listTopY();
+      if (y >= ty && y < ty + rows * LIST_ROW_H) {
+        const int ri = s_top + (y - ty) / LIST_ROW_H;
+        if (ri >= 0 && ri < (int)s_rows.size() && !s_rows[ri].header) {
+          if (ri == s_sel) loadSelected();
+          else { s_sel = ri; drawList(); }
+        }
+      }
+    } else if (s_scr == AScreen::Control) {
+      const int k = FeatureUI::hit(s_btn, (int)B_COUNT, x, y);
+      if (k >= 0) {
+        s_navSel = k;
+        acDrawBtn(k, true);
+        acButton(k);
+        delay(90);
+        drawControl();   // atualiza linha de estado + botoes
+      }
+    }
+  }
+  if (!touchNow) touchWas = false;
+
+  delay(10);
+}
+
+}  // namespace IRUniversalAC

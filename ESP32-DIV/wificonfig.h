@@ -37,6 +37,7 @@ using namespace std;
 namespace PacketMonitor {
   void ptmSetup();
   void ptmLoop();
+  void ptmTeardown();
 }
 
 namespace BeaconSpammer {
@@ -87,6 +88,11 @@ namespace ArpScanner {
 namespace KarmaAttack {
   void karmaSetup();
   void karmaLoop();
+}
+
+namespace WifiAudit {
+  void wifiAuditSetup();
+  void wifiAuditLoop();
 }
 
 namespace FirmwareUpdate {

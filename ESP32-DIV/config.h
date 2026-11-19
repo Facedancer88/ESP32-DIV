@@ -30,16 +30,17 @@
 // exposes BLEDevice/BLEScan/etc as aliases to NimBLE types.
 #include "BleCompat.h"
 
-#include "esp_bt.h"
-#include "esp_bt_main.h"
-#include "esp_gap_bt_api.h"
+//#include "esp_bt.h"
+//#include "esp_bt_main.h"
+//#include "esp_gap_bt_api.h"
 
 #include "arduinoFFT.h"
 #include "ELECHOUSE_CC1101_SRC_DRV.h"
 #include "utils.h"
 #include "shared.h"
 
-using namespace std;
+using std::string;
+using std::vector;
 
 /* ───────────── Common externs ───────────── */
 extern TFT_eSPI tft;
@@ -55,6 +56,9 @@ namespace BleSpoofer {
   void spooferSetup();
   void spooferLoop();
   void exit();
+  void blastSetup();
+  void blastLoop();
+  void blastExit();
 }
 namespace SourApple {
   void sourappleSetup();
@@ -139,6 +143,7 @@ namespace SavedProfile {
 namespace subjammer {
   void subjammerSetup();
   void subjammerLoop();
+  void exit();
 }
 namespace SubBrute {
   void subBruteSetup();
@@ -148,11 +153,16 @@ namespace jammingdetector {
   void Setup();
   void Loop();
 }
+namespace freqscanner {
+  void Setup();
+  void Loop();
+}
 
 /* ───────────── WiFi namespaces ───────────── */
 namespace PacketMonitor {
   void ptmSetup();
   void ptmLoop();
+  void ptmTeardown();
 }
 namespace BeaconSpammer {
   void beaconSpamSetup();
@@ -201,6 +211,10 @@ namespace ArpScanner {
 namespace KarmaAttack {
   void karmaSetup();
   void karmaLoop();
+}
+namespace WifiAudit {
+  void wifiAuditSetup();
+  void wifiAuditLoop();
 }
 namespace FirmwareUpdate {
   void updateSetup();

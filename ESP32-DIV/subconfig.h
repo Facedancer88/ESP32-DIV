@@ -31,6 +31,7 @@ namespace SavedProfile {
 namespace subjammer {
   void subjammerSetup();
   void subjammerLoop();
+  void exit();
 }
 
 namespace SubBrute {
@@ -39,6 +40,11 @@ namespace SubBrute {
 }
 
 namespace jammingdetector {
+  void Setup();
+  void Loop();
+}
+
+namespace freqscanner {
   void Setup();
   void Loop();
 }

